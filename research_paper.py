@@ -32,6 +32,9 @@ from sklearn.decomposition import PCA
 from ipca import InstrumentedPCA
 from sklearn.cross_decomposition import PLSRegression
 import lightgbm as lgb
+import torch
+import torch.nn as nn
+from torch.utils.data import DataLoader, TensorDataset
 from pandas.tseries.offsets import YearEnd, YearBegin, MonthBegin, DateOffset
 import statsmodels.api as sm
 import matplotlib.pyplot as plt
@@ -4901,6 +4904,883 @@ def run_rf_model(
         number_of_features,
         rf_r2)
 
+# FFNN model
+class FeedForwardNeuralNetwork(nn.Module):
+    """
+    Feedforward neural network for return forecasting.
+    """
+    def __init__(self, n_features, hidden_layers, dropout=0.0):
+        super().__init__()
+
+        layers = []
+        in_features = int(n_features)
+
+        for hidden_units in hidden_layers:
+            layers.append(nn.Linear(in_features, int(hidden_units)))
+            layers.append(nn.ReLU())
+
+            if dropout > 0:
+                layers.append(nn.Dropout(float(dropout)))
+
+            in_features = int(hidden_units)
+
+        layers.append(nn.Linear(in_features, 1))
+        self.network = nn.Sequential(*layers)
+
+    def forward(self, x):
+        return self.network(x).squeeze(-1)
+
+def run_ffnn_model(
+    input_filename="Processed data/df_processed.parquet",
+    predictions_filename="Model output/FFNN_predictions.parquet",
+    vi_average_filename="Model output/FFNN_variable_importance_average.parquet",
+    vi_time_varying_filename="Model output/FFNN_variable_importance_time_varying.parquet",
+    features_filename="Model output/FFNN_number_of_features.parquet",
+    model_output_dir="Model output",
+    permno_col="permno",
+    date_col="date",
+    y_true_col="ret_exc",
+    characteristic_cols=None,
+    universe="all",
+    me_col="me",
+    universe_size=1000,
+    industry_code_func=None,
+    split_func=rolling_train_val_test_yearly,
+    start_train="1970-01-01",
+    end_train="1986-12-31",
+    val_years=12,
+    hidden_layers_grid=(1, 2, 3, 4, 5),
+    hidden_layer_units=(32, 16, 8, 4, 2),
+    l1_penalty_grid=(1e-5,),
+    learning_rate_grid=(0.001,),
+    batch_size=10000,
+    epochs=50,
+    patience=3,
+    ensemble=3,
+    benchmark_pred=None,
+    random_state=0,
+    device="cuda",
+    print_r2=True):
+    """
+    Runs FFNN.
+    """
+    (BASE_DIR / model_output_dir).mkdir(parents=True, exist_ok=True)
+
+    if industry_code_func is None:
+        industry_code_func = sic_industry_code_for_demeaning
+
+    device = torch.device(device)
+
+    if device.type != "cuda":
+        raise ValueError("FFNN training is GPU-only; pass device='cuda' or 'cuda:0'.")
+
+    if not torch.cuda.is_available():
+        raise RuntimeError("FFNN training requires a CUDA-capable GPU, but CUDA is not available.")
+
+    torch.manual_seed(random_state)
+    np.random.seed(random_state)
+
+    def is_sequence_argument(value):
+        return isinstance(value, (list, tuple, np.ndarray))
+
+    if is_sequence_argument(predictions_filename):
+        if is_sequence_argument(hidden_layers_grid):
+            hidden_layer_counts = [
+                int(hidden_layer_count)
+                for hidden_layer_count in hidden_layers_grid]
+        else:
+            hidden_layer_counts = [int(hidden_layers_grid)]
+
+        n_models = len(predictions_filename)
+
+        if len(hidden_layer_counts) != n_models:
+            raise ValueError(
+                "When predictions_filename is a sequence, hidden_layers_grid "
+                "must have the same length. Files and hidden-layer counts are "
+                "paired strictly by order.")
+
+        def filename_sequence(value, argument_name):
+            if not is_sequence_argument(value):
+                raise ValueError(
+                    f"{argument_name} must be a sequence when "
+                    "predictions_filename is a sequence.")
+
+            value = list(value)
+
+            if len(value) != n_models:
+                raise ValueError(
+                    f"{argument_name} must have length {n_models} to match "
+                    "predictions_filename.")
+
+            return value
+
+        prediction_filenames = list(predictions_filename)
+        vi_average_filenames = filename_sequence(
+            vi_average_filename,
+            "vi_average_filename")
+        vi_time_varying_filenames = filename_sequence(
+            vi_time_varying_filename,
+            "vi_time_varying_filename")
+        feature_filenames = filename_sequence(
+            features_filename,
+            "features_filename")
+        prediction_outputs = {}
+        variable_importance_averages = {}
+        variable_importance_time_varying_outputs = {}
+        number_of_features_outputs = {}
+        r2_records = []
+
+        for model_idx, hidden_layer_count in enumerate(hidden_layer_counts):
+            output_name = Path(prediction_filenames[model_idx]).stem
+
+            (
+                prediction_output,
+                variable_importance_average,
+                variable_importance_time_varying,
+                number_of_features,
+                ffnn_r2) = run_ffnn_model(
+                    input_filename=input_filename,
+                    predictions_filename=prediction_filenames[model_idx],
+                    vi_average_filename=vi_average_filenames[model_idx],
+                    vi_time_varying_filename=vi_time_varying_filenames[model_idx],
+                    features_filename=feature_filenames[model_idx],
+                    model_output_dir=model_output_dir,
+                    permno_col=permno_col,
+                    date_col=date_col,
+                    y_true_col=y_true_col,
+                    characteristic_cols=characteristic_cols,
+                    universe=universe,
+                    me_col=me_col,
+                    universe_size=universe_size,
+                    industry_code_func=industry_code_func,
+                    split_func=split_func,
+                    start_train=start_train,
+                    end_train=end_train,
+                    val_years=val_years,
+                    hidden_layers_grid=hidden_layer_count,
+                    hidden_layer_units=hidden_layer_units,
+                    l1_penalty_grid=l1_penalty_grid,
+                    learning_rate_grid=learning_rate_grid,
+                    batch_size=batch_size,
+                    epochs=epochs,
+                    patience=patience,
+                    ensemble=ensemble,
+                    benchmark_pred=benchmark_pred,
+                    random_state=random_state + model_idx * 1000000,
+                    device=device,
+                    print_r2=False)
+
+            prediction_outputs[output_name] = prediction_output
+            variable_importance_averages[output_name] = variable_importance_average
+            variable_importance_time_varying_outputs[output_name] = variable_importance_time_varying
+            number_of_features_outputs[output_name] = number_of_features
+
+            r2_record = {
+                "output_name": output_name,
+                "hidden_layer_count": int(hidden_layer_count),
+                "architecture": f"NN{int(hidden_layer_count)}"}
+            r2_record.update(ffnn_r2)
+            r2_records.append(r2_record)
+
+        ffnn_r2 = pd.DataFrame(r2_records)
+
+        if print_r2:
+            print(
+                f"Out-of-Sample R² of the FFNN models "
+                f"({universe} universe):")
+            with pd.option_context(
+                "display.max_rows", None,
+                "display.max_columns", None,
+                "display.width", 180,
+                "display.float_format", "{:,.6f}".format):
+                print(ffnn_r2.to_string(index=False))
+
+        return (
+            prediction_outputs,
+            variable_importance_averages,
+            variable_importance_time_varying_outputs,
+            number_of_features_outputs,
+            ffnn_r2)
+
+    prediction_records = []
+    variable_importance_records = []
+    feature_records = []
+
+    # --------------------------------------------------------------------------
+    # Data loading
+    # --------------------------------------------------------------------------
+    df_ffnn = load_parquet(input_filename)
+
+    df_ffnn[date_col] = pd.to_datetime(df_ffnn[date_col])
+    df_ffnn = df_ffnn.sort_values([
+        permno_col,
+        date_col]).copy()
+
+    valid_universes = [
+        "all",
+        "top",
+        "bottom"]
+
+    if universe not in valid_universes:
+        raise ValueError(f"universe must be one of {valid_universes}.")
+
+    # Universe selection based on lagged market equity
+    me_lag_col = f"{me_col}_lag"
+
+    if universe != "all":
+        if me_col not in df_ffnn.columns:
+            raise ValueError(f"Market equity column \"{me_col}\" not found in dataframe.")
+
+        df_ffnn[me_lag_col] = (
+            df_ffnn.groupby(permno_col)[me_col].shift(1))
+
+        df_ffnn = df_ffnn.dropna(
+            subset=[
+                me_lag_col]).copy()
+
+        if universe == "top":
+            df_ffnn = (
+                df_ffnn.sort_values([
+                    date_col,
+                    me_lag_col], ascending=[
+                        True,
+                        False]).groupby(
+                            date_col,
+                            group_keys=False).head(universe_size).copy())
+
+        elif universe == "bottom":
+            df_ffnn = (
+                df_ffnn.sort_values([
+                    date_col,
+                    me_lag_col], ascending=[
+                        True,
+                        True]).groupby(
+                            date_col,
+                            group_keys=False).head(universe_size).copy())
+
+        df_ffnn = df_ffnn.sort_values([
+            permno_col,
+            date_col]).copy()
+
+    if characteristic_cols is None:
+        characteristic_cols = [
+            col for col in char_cols
+            if col in df_ffnn.columns]
+    else:
+        characteristic_cols = [
+            col for col in characteristic_cols
+            if col in df_ffnn.columns]
+
+    if not characteristic_cols:
+        raise ValueError("No valid characteristic columns found for FFNN.")
+
+    # Set panel
+    panel_df = df_ffnn[[
+        permno_col,
+        date_col,
+        y_true_col]].copy()
+
+    panel_df["firm"] = panel_df[permno_col].astype(np.int64)
+    panel_df["year_month"] = panel_df[date_col].dt.to_period("M")
+
+    characteristic_df = df_ffnn[[
+        permno_col,
+        date_col] + characteristic_cols].copy()
+
+    characteristic_df["firm"] = characteristic_df[permno_col].astype(np.int64)
+    characteristic_df["year_month"] = characteristic_df[date_col].dt.to_period("M")
+
+    characteristic_df = (
+        characteristic_df.set_index([
+            "firm",
+            "year_month"]).sort_index())
+
+    panel_df = (
+        panel_df.set_index([
+            "firm",
+            "year_month"]).sort_index())
+
+    lagged_characteristics = (
+        characteristic_df[characteristic_cols].groupby(level="firm").shift(1))
+
+    lagged_characteristics.columns = [
+        f"{col}_lag"
+        for col in lagged_characteristics.columns]
+
+    panel_df = pd.concat([
+        panel_df,
+        lagged_characteristics], axis=1)
+
+    lagged_characteristic_cols = lagged_characteristics.columns.tolist()
+
+    df_clean = panel_df.dropna(
+        subset=[
+            y_true_col] + lagged_characteristic_cols).copy()
+
+    X_all = df_clean[lagged_characteristic_cols].apply(
+        pd.to_numeric,
+        errors="coerce")
+
+    y_true_all = pd.to_numeric(
+        df_clean[y_true_col],
+        errors="coerce")
+
+    valid_mask = (
+        X_all.notna().all(axis=1)
+        & y_true_all.notna())
+
+    X_all = X_all.loc[valid_mask]
+    y_true_all = y_true_all.loc[valid_mask].astype(float)
+
+    constant_cols = [
+        col for col in X_all.columns
+        if X_all[col].nunique(dropna=True) <= 1]
+
+    if constant_cols:
+        X_all = X_all.drop(columns=constant_cols)
+        lagged_characteristic_cols = [
+            col for col in lagged_characteristic_cols
+            if col not in constant_cols]
+
+    dates_all = df_clean.loc[X_all.index, date_col]
+
+    # Set industry demeaning
+    industry_code = industry_code_func(
+        df=df_ffnn,
+        target_index=X_all.index,
+        permno_col=permno_col,
+        date_col=date_col,
+        sic_prefix="sic",
+        firm_index_name="firm",
+        month_index_name="year_month")
+
+    if isinstance(hidden_layers_grid, (int, np.integer)):
+        hidden_layers_grid = (int(hidden_layers_grid),)
+
+    hidden_layer_units = tuple(int(units) for units in hidden_layer_units)
+    architecture_grid = []
+
+    for hidden_layer_count in hidden_layers_grid:
+        hidden_layer_count = int(hidden_layer_count)
+
+        if hidden_layer_count < 1 or hidden_layer_count > len(hidden_layer_units):
+            raise ValueError(
+                "hidden_layers_grid entries must be between 1 and "
+                f"{len(hidden_layer_units)}.")
+
+        architecture_grid.append((
+            hidden_layer_count,
+            hidden_layer_units[:hidden_layer_count]))
+
+    def make_loader(X_values, y_values, shuffle, seed):
+        generator = torch.Generator()
+        generator.manual_seed(int(seed))
+
+        dataset = TensorDataset(
+            torch.as_tensor(X_values, dtype=torch.float32),
+            torch.as_tensor(y_values, dtype=torch.float32))
+
+        return DataLoader(
+            dataset,
+            batch_size=int(batch_size),
+            shuffle=shuffle,
+            generator=generator)
+
+    def predict_ffnn(model, X_values):
+        model.eval()
+        predictions = []
+
+        with torch.no_grad():
+            for start in range(0, len(X_values), int(batch_size)):
+                X_batch = torch.as_tensor(
+                    X_values[start:start + int(batch_size)],
+                    dtype=torch.float32,
+                    device=device)
+
+                batch_predictions = model(X_batch).detach().cpu().numpy()
+                predictions.append(batch_predictions)
+
+        if predictions:
+            return np.concatenate(predictions)
+
+        return np.array([], dtype=float)
+
+    def fit_ffnn_member(
+        X_train_values,
+        y_train_values,
+        X_score_values,
+        y_score_values,
+        hidden_layers,
+        l1_penalty,
+        learning_rate,
+        seed):
+
+        torch.manual_seed(int(seed))
+        np.random.seed(int(seed))
+
+        model = FeedForwardNeuralNetwork(
+            n_features=X_train_values.shape[1],
+            hidden_layers=hidden_layers).to(device)
+
+        optimizer = torch.optim.Adam(
+            model.parameters(),
+            lr=float(learning_rate))
+
+        criterion = nn.MSELoss()
+        train_loader = make_loader(
+            X_train_values,
+            y_train_values,
+            shuffle=True,
+            seed=seed)
+
+        best_state = None
+        best_epoch = 0
+        best_score = -np.inf
+        best_train_loss = np.nan
+        best_score_loss = np.nan
+        patience_counter = 0
+
+        for epoch in range(1, int(epochs) + 1):
+            model.train()
+            epoch_losses = []
+
+            for X_batch, y_batch in train_loader:
+                X_batch = X_batch.to(device)
+                y_batch = y_batch.to(device)
+
+                optimizer.zero_grad()
+                y_pred = model(X_batch)
+                loss = criterion(y_pred, y_batch)
+
+                if float(l1_penalty) > 0:
+                    l1_norm = torch.tensor(0.0, device=device)
+                    for parameter in model.parameters():
+                        l1_norm = l1_norm + parameter.abs().sum()
+                    loss = loss + float(l1_penalty) * l1_norm
+
+                loss.backward()
+                optimizer.step()
+                epoch_losses.append(loss.detach().cpu().item())
+
+            y_score_pred = predict_ffnn(model, X_score_values)
+            score = r2_oos(
+                y_true=y_score_values,
+                y_pred=y_score_pred,
+                benchmark_pred=benchmark_pred)["r2_oos"]
+            score_loss = np.mean((y_score_values - y_score_pred) ** 2)
+            train_loss = float(np.mean(epoch_losses)) if epoch_losses else np.nan
+
+            if np.isfinite(score) and score > best_score:
+                best_score = score
+                best_epoch = epoch
+                best_train_loss = train_loss
+                best_score_loss = score_loss
+                best_state = {
+                    key: value.detach().cpu().clone()
+                    for key, value in model.state_dict().items()}
+                patience_counter = 0
+            else:
+                patience_counter += 1
+
+            if patience_counter >= int(patience):
+                break
+
+        if best_state is not None:
+            model.load_state_dict(best_state)
+
+        return {
+            "model": model,
+            "best_epoch": best_epoch,
+            "best_score": best_score,
+            "best_train_loss": best_train_loss,
+            "best_score_loss": best_score_loss}
+
+    # --------------------------------------------------------------------------
+    # Sample split and FFNN model
+    # --------------------------------------------------------------------------
+    for split_idx, (tr_start, tr_end, va_start, va_end, te_start, te_end) in enumerate(
+        split_func(
+            df_ffnn,
+            date_col=date_col,
+            start_train=start_train,
+            end_train=end_train,
+            val_years=val_years)):
+
+        train_mask = (
+            (dates_all >= tr_start)
+            & (dates_all <= tr_end))
+
+        validation_mask = (
+            (dates_all >= va_start)
+            & (dates_all <= va_end))
+
+        test_mask = (
+            (dates_all >= te_start)
+            & (dates_all <= te_end))
+
+        if train_mask.sum() == 0 or test_mask.sum() == 0:
+            continue
+
+        X_train = X_all.loc[train_mask]
+        y_true_train = y_true_all.loc[train_mask]
+
+        X_validation = X_all.loc[validation_mask]
+        y_true_validation = y_true_all.loc[validation_mask]
+
+        X_test = X_all.loc[test_mask]
+        y_true_test = y_true_all.loc[test_mask]
+
+        industry_train = industry_code.loc[train_mask]
+        industry_validation = industry_code.loc[validation_mask]
+        industry_test = industry_code.loc[test_mask]
+
+        year_month_train = X_train.index.get_level_values("year_month")
+        year_month_validation = X_validation.index.get_level_values("year_month")
+        year_month_test = X_test.index.get_level_values("year_month")
+
+        # Per-cell zero masking
+        X_train_masked = X_train.mask(X_train == 0.0)
+        X_validation_masked = X_validation.mask(X_validation == 0.0)
+        X_test_masked = X_test.mask(X_test == 0.0)
+
+        train_industry_month_keys = pd.MultiIndex.from_arrays([
+            industry_train,
+            year_month_train], names=[
+                "industry",
+                "year_month"])
+
+        industry_month_means = X_train_masked.groupby(train_industry_month_keys).mean()
+        industry_means = X_train_masked.groupby(industry_train).mean()
+
+        def make_mean_rows(industry_series, year_month_index):
+            keys = pd.MultiIndex.from_arrays([
+                industry_series,
+                year_month_index], names=[
+                    "industry",
+                    "year_month"])
+
+            mean_rows = industry_month_means.reindex(keys).to_numpy()
+            missing_industry_month = np.isnan(mean_rows).all(axis=1)
+
+            if missing_industry_month.any():
+                mean_rows[missing_industry_month] = (
+                    industry_means.reindex(industry_series[missing_industry_month]).to_numpy())
+
+            mean_rows[np.isnan(mean_rows)] = 0.0
+
+            return mean_rows
+
+        def impute_and_demean(X, industry_series, year_month_index):
+            if len(X) == 0:
+                return X.copy()
+
+            mean_rows = make_mean_rows(
+                industry_series,
+                year_month_index)
+
+            X_values = X.to_numpy(dtype=float, copy=True)
+            missing_values = np.isnan(X_values)
+            X_values[missing_values] = mean_rows[missing_values]
+            X_demeaned = X_values - mean_rows
+
+            X_demeaned = pd.DataFrame(
+                X_demeaned,
+                index=X.index,
+                columns=X.columns)
+
+            X_demeaned = (
+                X_demeaned.replace([np.inf, -np.inf], 0.0).fillna(0.0).astype(np.float32))
+
+            return X_demeaned
+
+        X_train_demeaned = impute_and_demean(
+            X_train_masked,
+            industry_train,
+            year_month_train)
+
+        X_validation_demeaned = impute_and_demean(
+            X_validation_masked,
+            industry_validation,
+            year_month_validation)
+
+        X_test_demeaned = impute_and_demean(
+            X_test_masked,
+            industry_test,
+            year_month_test)
+
+        X_mean = X_train_demeaned.mean(axis=0)
+        X_std = X_train_demeaned.std(axis=0).replace(0.0, 1.0).fillna(1.0)
+
+        X_train_scaled = ((X_train_demeaned - X_mean) / X_std).astype(np.float32)
+        X_validation_scaled = ((X_validation_demeaned - X_mean) / X_std).astype(np.float32)
+        X_test_scaled = ((X_test_demeaned - X_mean) / X_std).astype(np.float32)
+
+        X_train_values = X_train_scaled.to_numpy(dtype=np.float32)
+        y_train_values = y_true_train.to_numpy(dtype=np.float32)
+
+        use_validation = len(X_validation_scaled) > 0
+
+        if use_validation:
+            X_score_values = X_validation_scaled.to_numpy(dtype=np.float32)
+            y_score_values = y_true_validation.to_numpy(dtype=np.float32)
+        else:
+            X_score_values = X_train_values
+            y_score_values = y_train_values
+
+        best_params = None
+        best_score = -np.inf
+        best_member_summaries = []
+
+        for hidden_layer_count, hidden_layers in architecture_grid:
+            hidden_layers = tuple(hidden_layers)
+
+            for l1_penalty in l1_penalty_grid:
+                for learning_rate in learning_rate_grid:
+                    member_predictions = []
+                    member_summaries = []
+
+                    for member_idx in range(int(ensemble)):
+                        member_seed = (
+                            int(random_state)
+                            + split_idx * 100000
+                            + member_idx)
+
+                        fitted_member = fit_ffnn_member(
+                            X_train_values=X_train_values,
+                            y_train_values=y_train_values,
+                            X_score_values=X_score_values,
+                            y_score_values=y_score_values,
+                            hidden_layers=hidden_layers,
+                            l1_penalty=l1_penalty,
+                            learning_rate=learning_rate,
+                            seed=member_seed)
+
+                        member_predictions.append(
+                            predict_ffnn(
+                                fitted_member["model"],
+                                X_score_values))
+                        member_summaries.append(fitted_member)
+
+                    ensemble_score_predictions = np.mean(
+                        np.column_stack(member_predictions),
+                        axis=1)
+
+                    score = r2_oos(
+                        y_true=y_score_values,
+                        y_pred=ensemble_score_predictions,
+                        benchmark_pred=benchmark_pred)["r2_oos"]
+
+                    if np.isfinite(score) and score > best_score:
+                        best_score = score
+                        best_params = {
+                            "hidden_layer_count": int(hidden_layer_count),
+                            "hidden_layers": hidden_layers,
+                            "architecture": f"NN{hidden_layer_count}",
+                            "l1_penalty": float(l1_penalty),
+                            "learning_rate": float(learning_rate)}
+                        best_member_summaries = member_summaries
+
+        if best_params is None:
+            best_params = {
+                "hidden_layer_count": int(architecture_grid[0][0]),
+                "hidden_layers": tuple(architecture_grid[0][1]),
+                "architecture": f"NN{architecture_grid[0][0]}",
+                "l1_penalty": float(l1_penalty_grid[0]),
+                "learning_rate": float(learning_rate_grid[0])}
+            best_member_summaries = []
+
+        # Final ensemble refit on training sample with validation early stopping
+        final_members = []
+        member_best_epochs = []
+        member_best_scores = []
+        member_train_losses = []
+        member_score_losses = []
+
+        for member_idx in range(int(ensemble)):
+            member_seed = (
+                int(random_state)
+                + split_idx * 100000
+                + 50000
+                + member_idx)
+
+            fitted_member = fit_ffnn_member(
+                X_train_values=X_train_values,
+                y_train_values=y_train_values,
+                X_score_values=X_score_values,
+                y_score_values=y_score_values,
+                hidden_layers=best_params["hidden_layers"],
+                l1_penalty=best_params["l1_penalty"],
+                learning_rate=best_params["learning_rate"],
+                seed=member_seed)
+
+            final_members.append(fitted_member["model"])
+            member_best_epochs.append(fitted_member["best_epoch"])
+            member_best_scores.append(fitted_member["best_score"])
+            member_train_losses.append(fitted_member["best_train_loss"])
+            member_score_losses.append(fitted_member["best_score_loss"])
+
+        n_used_features = X_train_scaled.shape[1]
+
+        feature_records.append({
+            "date": te_end,
+            "Number of Features": n_used_features})
+
+        X_test_values = X_test_scaled.to_numpy(dtype=np.float32)
+        y_pred_members = [
+            predict_ffnn(model, X_test_values)
+            for model in final_members]
+
+        y_pred_test = np.mean(
+            np.column_stack(y_pred_members),
+            axis=1)
+
+        prediction_df = pd.DataFrame({
+            "permno": X_test_scaled.index.get_level_values("firm").astype("int64"),
+            "date": dates_all.loc[test_mask].to_numpy(),
+            "year_month": X_test_scaled.index.get_level_values("year_month").astype(str),
+            "y_true": y_true_test.values,
+            "y_pred": np.asarray(y_pred_test)})
+
+        prediction_records.append(prediction_df)
+
+        # Variable importance
+        base_r2 = r2_oos(
+            y_true=y_true_test.values,
+            y_pred=y_pred_test,
+            benchmark_pred=benchmark_pred)["r2_oos"]
+
+        for variable in X_test_scaled.columns:
+            X_zero = X_test_scaled.copy()
+            X_zero[variable] = 0.0
+            X_zero_values = X_zero.to_numpy(dtype=np.float32)
+
+            y_pred_zero_members = [
+                predict_ffnn(model, X_zero_values)
+                for model in final_members]
+
+            y_pred_zero = np.mean(
+                np.column_stack(y_pred_zero_members),
+                axis=1)
+
+            zero_r2 = r2_oos(
+                y_true=y_true_test.values,
+                y_pred=y_pred_zero,
+                benchmark_pred=benchmark_pred)["r2_oos"]
+
+            variable_importance = base_r2 - zero_r2
+
+            variable_importance_records.append({
+                "date": te_end,
+                "variable": variable.removesuffix("_lag"),
+                "variable_importance": variable_importance})
+
+    # --------------------------------------------------------------------------
+    # Build output dataframe
+    # --------------------------------------------------------------------------
+    if prediction_records:
+        prediction_output = pd.concat(
+            prediction_records,
+            ignore_index=True)
+    else:
+        prediction_output = pd.DataFrame(
+            columns=[
+                "permno",
+                "date",
+                "year_month",
+                "y_true",
+                "y_pred"])
+
+    prediction_output = prediction_output[[
+        "permno",
+        "date",
+        "year_month",
+        "y_true",
+        "y_pred"]]
+
+    if variable_importance_records:
+        variable_importance_time_varying = pd.DataFrame(variable_importance_records)
+    else:
+        variable_importance_time_varying = pd.DataFrame(
+            columns=[
+                "date",
+                "variable",
+                "variable_importance"])
+
+    variable_importance_time_varying = variable_importance_time_varying[[
+        "date",
+        "variable",
+        "variable_importance"]]
+
+    variable_importance_average = (
+        variable_importance_time_varying.groupby(
+            "variable",
+            as_index=False).agg(
+                variable_importance=("variable_importance", "mean")).sort_values(
+                    "variable_importance",
+                    ascending=False))
+
+    variable_importance_average = variable_importance_average[[
+        "variable",
+        "variable_importance"]]
+
+    if feature_records:
+        number_of_features = pd.DataFrame(feature_records)
+    else:
+        number_of_features = pd.DataFrame(
+            columns=[
+                "date",
+                "Number of Features"])
+
+    number_of_features = number_of_features[[
+        "date",
+        "Number of Features"]]
+
+    # Save output files
+    save_parquet(
+        prediction_output,
+        predictions_filename,
+        index=False,
+        compression="snappy")
+
+    save_parquet(
+        variable_importance_average,
+        vi_average_filename,
+        index=False,
+        compression="snappy")
+
+    save_parquet(
+        variable_importance_time_varying,
+        vi_time_varying_filename,
+        index=False,
+        compression="snappy")
+
+    save_parquet(
+        number_of_features,
+        features_filename,
+        index=False,
+        compression="snappy")
+
+    # --------------------------------------------------------------------------
+    # Performance evaluation
+    # --------------------------------------------------------------------------
+    ffnn_r2 = r2_oos(
+        y_true=prediction_output["y_true"],
+        y_pred=prediction_output["y_pred"],
+        benchmark_pred=benchmark_pred)
+
+    if print_r2:
+        print(
+            f"Out-of-Sample R² of the FFNN model "
+            f"({universe} universe): "
+            f"{ffnn_r2['r2_oos'] * 100:.2f}%")
+
+    return (
+        prediction_output,
+        variable_importance_average,
+        variable_importance_time_varying,
+        number_of_features,
+        ffnn_r2)
+
 # Non-linear ensemble model
 def run_nonlinear_ensemble_model(
     nonlinear_model_prediction_files,
@@ -5785,7 +6665,18 @@ def display_risk_adjusted_performance(
         raise ValueError(f"FF5 file is missing columns: {missing_ff5_cols}")
 
     ff5 = ff5.rename(columns={"Unnamed: 0": date_col})
-    ff5[date_col] = pd.to_datetime(ff5[date_col].astype(str))
+    ff5_date_text = (
+        ff5[date_col].astype(str).str.strip().str.replace(r"\.0$", "", regex=True))
+    ff5[date_col] = pd.to_datetime(
+        ff5_date_text,
+        format="%Y%m",
+        errors="coerce")
+
+    missing_ff5_dates = ff5[date_col].isna()
+    if missing_ff5_dates.any():
+        ff5.loc[missing_ff5_dates, date_col] = pd.to_datetime(
+            ff5_date_text[missing_ff5_dates],
+            errors="coerce")
 
     factor_cols = ["Mkt-RF", "SMB", "HML", "RMW", "CMA", "RF"]
 
@@ -5847,10 +6738,10 @@ def display_risk_adjusted_performance(
             "portfolio": portfolio_name,
             "n_obs": len(merged),
             "CAPM_alpha": capm.params.get("const", np.nan),
-            "CAPM_alpha_p_value": capm.pvalues.get("const", np.nan),
+            "CAPM_alpha_t_stat": capm.tvalues.get("const", np.nan),
             "CAPM_R2": capm.rsquared,
             "FF5_alpha": ff5_model.params.get("const", np.nan),
-            "FF5_alpha_p_value": ff5_model.pvalues.get("const", np.nan),
+            "FF5_alpha_t_stat": ff5_model.tvalues.get("const", np.nan),
             "FF5_R2": ff5_model.rsquared,
             "nw_lags": lags})
 
@@ -5906,7 +6797,18 @@ def display_macro_co_movement(
     if missing_macro_cols:
         raise ValueError(f"Macro file is missing columns: {missing_macro_cols}")
 
-    macro[date_col] = pd.to_datetime(macro[date_col])
+    macro_date_text = (
+        macro[date_col].astype(str).str.strip().str.replace(r"\.0$", "", regex=True))
+    macro[date_col] = pd.to_datetime(
+        macro_date_text,
+        format="%Y%m",
+        errors="coerce")
+
+    missing_macro_dates = macro[date_col].isna()
+    if missing_macro_dates.any():
+        macro.loc[missing_macro_dates, date_col] = pd.to_datetime(
+            macro_date_text[missing_macro_dates],
+            errors="coerce")
     for col in macro_cols:
         macro[col] = pd.to_numeric(macro[col], errors="coerce")
 
@@ -5949,13 +6851,13 @@ def display_macro_co_movement(
             "portfolio": portfolio_name,
             "n_obs": len(merged),
             "alpha": model.params.get("const", np.nan),
-            "alpha_p_value": model.pvalues.get("const", np.nan),
+            "alpha_t_stat": model.tvalues.get("const", np.nan),
             "R2": model.rsquared,
             "nw_lags": lags}
 
         for col in macro_cols:
             record[f"coef_{col}"] = model.params.get(col, np.nan)
-            record[f"p_value_{col}"] = model.pvalues.get(col, np.nan)
+            record[f"t_stat_{col}"] = model.tvalues.get(col, np.nan)
 
         results.append(record)
 
@@ -6219,7 +7121,7 @@ def create_model_complexity_graph(
                     "model",
                     "date"]).reset_index(drop=True))
 
-    line_styles = ["-", "-", "-", ":"]
+    line_styles = ["-", "-", "-", "-"]
     palette = [
         "#0072B2",
         "#D55E00",
@@ -6227,7 +7129,25 @@ def create_model_complexity_graph(
         "#CC79A7",
         "#E69F00",
         "#56B4E9",
-        "#000000"]
+        "#332288",
+        "#882255",
+        "#44AA99",
+        "#999933",
+        "#AA4499",
+        "#117733",
+        "#88CCEE",
+        "#DDCC77",
+        "#CC6677",
+        "#6699CC",
+        "#661100",
+        "#669900",
+        "#AA4466",
+        "#4477AA",
+        "#EE6677",
+        "#228833",
+        "#BBBBBB",
+        "#EE7733",
+        "#EE3377"]
 
     def _style_axis(ax, y_label):
         ax.set_facecolor("white")
@@ -6240,7 +7160,7 @@ def create_model_complexity_graph(
 
         ax.tick_params(
             axis="both",
-            labelsize=16,
+            labelsize=26,
             width=0.8,
             length=4)
 
@@ -6251,18 +7171,18 @@ def create_model_complexity_graph(
 
         ax.set_xlabel(
             "Year",
-            fontsize=16)
+            fontsize=26)
         ax.set_ylabel(
             y_label,
-            fontsize=16)
+            fontsize=26)
 
     def _legend_below(fig, ax, n_labels):
         ax.legend(
             loc="upper center",
             bbox_to_anchor=(0.5, -0.16),
-            ncol=max(1, n_labels),
+            ncol=min(4, max(1, n_labels)),
             frameon=False,
-            fontsize=16,
+            fontsize=26,
             handlelength=2.4,
             columnspacing=1.4)
         fig.tight_layout(rect=[0.0, 0.12, 1.0, 1.0])
@@ -6296,7 +7216,7 @@ def create_model_complexity_graph(
     ax_components.yaxis.set_major_locator(
         MaxNLocator(integer=True))
     ax_components.set_title(
-        f"{title}: Component-based models" if title else "Component-based models",
+        f"{title}: Component-Based Models" if title else "Component-Based Models",
         fontsize=16,
         fontweight="bold")
     _legend_below(
@@ -6332,7 +7252,7 @@ def create_model_complexity_graph(
         ax_features,
         y_label=feature_ylabel)
     ax_features.set_title(
-        f"{title}: Feature-based models" if title else "Feature-based models",
+        f"{title}: Feature-Based Models" if title else "Feature-Based Models",
         fontsize=16,
         fontweight="bold")
     _legend_below(
@@ -6502,16 +7422,16 @@ def create_variable_importance_graphs(variable_importance_files, figsize=(14, 8)
 
     _style_axis(
         ax,
-        xlabel="Count in model top-20 variable lists",
-        ylabel="Variable family",
-        title="Variable-family representation in top 20 variables")
+        xlabel="Count in Model Top-20 Variable Lists",
+        ylabel="Variable Theme",
+        title="Variable-Theme Representation in Top 20 Variables")
 
     fig.tight_layout()
     plt.show()
 
     return top_variable_importance, family_importance
 
-# Time-varying family importance graphs for figures
+# Time-varying family importance figures
 def create_time_varying_family_importance_graphs(
     variable_importance_files,
     date_col="date",
@@ -6678,12 +7598,12 @@ def create_time_varying_family_importance_graphs(
 
         ax.set_xlabel(
             "Year",
-            fontsize=16)
+            fontsize=20)
         ax.set_ylabel(
-            "Share of total variable importance (%)",
-            fontsize=16)
+            "Share of Variable Importance",
+            fontsize=20)
         ax.set_title(
-            f"Time-varying family importance: {model_name}",
+            f"Time-Varying Family Importance: {model_name}",
             fontsize=16,
             fontweight="bold")
         ax.set_ylim(0.0, 100.0)
@@ -6701,7 +7621,7 @@ def create_time_varying_family_importance_graphs(
 
         ax.tick_params(
             axis="both",
-            labelsize=16,
+            labelsize=22,
             width=0.8,
             length=4)
 
@@ -6710,7 +7630,7 @@ def create_time_varying_family_importance_graphs(
             bbox_to_anchor=(0.5, -0.16),
             ncol=4,
             frameon=False,
-            fontsize=16,
+            fontsize=18,
             handlelength=1.8,
             columnspacing=1.2)
 
@@ -6723,11 +7643,11 @@ def create_time_varying_family_importance_graphs(
 
     return time_varying_family_importance
 
-# Extended variable-importance heatmap figure
+# Extended variable-importance heatmap figures
 def create_extended_variable_importance_heatmap(
     model_variable_importance,
-    variable_col="variable_importance",
-    vi_col="vi_raw",
+    variable_col="variable",
+    vi_col="variable_importance",
     figsize_width=42,
     min_fig_height=8,
     row_height_scale=0.4,
@@ -6735,13 +7655,18 @@ def create_extended_variable_importance_heatmap(
     heatmap_cmap="Blues",
     heatmap_linewidth=7.5,
     box_linewidth=2,
-    theme_label_fontsize=40,
-    cbar_label="Relative rank within model",
+    cbar_label="Relative Rank Within Model",
     strip_lag_suffix_for_display=True):
     """
     Creates an extended variable-importance heatmap across models.
     Within-model relative ranks computed from strictly positive variable-importance values
     """
+    model_label_fontsize = 50
+    variable_label_fontsize = 28
+    theme_title_fontsize = 50
+    colorbar_label_fontsize = 50
+    colorbar_tick_fontsize = 50
+
     if isinstance(model_variable_importance, dict):
         model_items = list(model_variable_importance.items())
     else:
@@ -6904,26 +7829,28 @@ def create_extended_variable_importance_heatmap(
                 linewidth=box_linewidth))
 
     ax.set_xticks(np.arange(n_models) + 0.5)
-    ax.set_xticklabels(model_names)
+    ax.set_xticklabels(model_names, fontsize=model_label_fontsize)
 
     ax.set_yticks(np.arange(n_rows) + 0.5)
-    ax.set_yticklabels(expanded_labels)
+    ax.set_yticklabels(expanded_labels, fontsize=variable_label_fontsize)
+    ax.tick_params(axis="x", length=0, labelsize=model_label_fontsize)
+    ax.tick_params(axis="y", length=0, labelsize=variable_label_fontsize)
 
     for theme, y_pos in theme_title_positions:
         ax.text(
             n_models / 2,
             y_pos,
-            theme.title(),
+            theme.upper(),
             ha="center",
             va="center",
-            fontsize=theme_label_fontsize,
-            fontweight="bold")
+            fontsize=theme_title_fontsize)
 
     for spine in ax.spines.values():
         spine.set_visible(False)
 
     cbar = fig.colorbar(mesh, ax=ax)
-    cbar.set_label(cbar_label, fontsize=theme_label_fontsize)
+    cbar.set_label(cbar_label, fontsize=colorbar_label_fontsize)
+    cbar.ax.tick_params(labelsize=colorbar_tick_fontsize)
 
     fig.tight_layout()
     plt.show()
@@ -6942,13 +7869,13 @@ def create_extended_variable_importance_heatmap(
 
     return fig, ax, relative_rank_matrix, expanded_matrix
 
-# Portfolio performance graphs
+# Portfolio performance figures
 def display_portfolio_performance_graphs(
     portfolio_files,
     date_col="date",
     gross_return_col="realized_return",
     net_return_col="net_realized_return",
-    figsize=(12, 7),
+    figsize=(14, 8),
     print_results=True):
     if isinstance(portfolio_files, dict):
         file_items = list(portfolio_files.items())
@@ -6974,7 +7901,22 @@ def display_portfolio_performance_graphs(
         "#332288",
         "#882255",
         "#44AA99",
-        "#999933"]
+        "#999933",
+        "#AA4499",
+        "#117733",
+        "#88CCEE",
+        "#DDCC77",
+        "#CC6677",
+        "#6699CC",
+        "#661100",
+        "#669900",
+        "#AA4466",
+        "#4477AA",
+        "#EE6677",
+        "#228833",
+        "#BBBBBB",
+        "#EE7733",
+        "#EE3377"]
 
     def _style_axis(ax, y_label, title, log_scale=False):
         ax.set_facecolor("white")
@@ -6986,7 +7928,7 @@ def display_portfolio_performance_graphs(
 
         ax.tick_params(
             axis="both",
-            labelsize=10,
+            labelsize=22,
             width=0.8,
             length=4)
 
@@ -7000,13 +7942,13 @@ def display_portfolio_performance_graphs(
 
         ax.set_xlabel(
             "Year",
-            fontsize=11)
+            fontsize=22)
         ax.set_ylabel(
             y_label,
-            fontsize=11)
+            fontsize=22)
         ax.set_title(
             title,
-            fontsize=12,
+            fontsize=16,
             fontweight="bold")
 
     def _add_below_legend(fig, ax, ncol=2):
@@ -7015,10 +7957,31 @@ def display_portfolio_performance_graphs(
             bbox_to_anchor=(0.5, -0.16),
             ncol=ncol,
             frameon=False,
-            fontsize=10,
+            fontsize=18,
             handlelength=2.4,
             columnspacing=1.4)
         fig.tight_layout(rect=[0.0, 0.12, 1.0, 1.0])
+
+    def _infer_weighting(portfolio_name, filename):
+        name_text = str(portfolio_name).lower()
+        file_text = str(filename).lower()
+        combined_text = f"{name_text} {file_text}"
+
+        if (
+            "_eq" in name_text
+            or name_text.endswith("eq")
+            or "equal_weight" in combined_text
+            or "equal weight" in combined_text):
+            return "EQ"
+
+        if (
+            "_vw" in name_text
+            or name_text.endswith("vw")
+            or "value_weight" in combined_text
+            or "value weight" in combined_text):
+            return "VW"
+
+        return "ALL"
 
     performance_records = []
 
@@ -7065,6 +8028,7 @@ def display_portfolio_performance_graphs(
         performance = pd.DataFrame({
             "date": portfolio.loc[valid_mask, date_col],
             "portfolio": portfolio_name,
+            "weighting": _infer_weighting(portfolio_name, filename),
             "gross_growth": gross_growth.loc[valid_mask],
             "net_growth": net_growth.loc[valid_mask]})
 
@@ -7101,8 +8065,8 @@ def display_portfolio_performance_graphs(
 
         _style_axis(
             ax,
-            y_label="Cumulative wealth (log scale)",
-            title=f"Portfolio performance: {portfolio_name}",
+            y_label="Cumulative Wealth (Log)",
+            title=f"Portfolio Performance: {portfolio_name}",
             log_scale=True)
         _add_below_legend(fig, ax, ncol=2)
         plt.show()
@@ -7123,8 +8087,8 @@ def display_portfolio_performance_graphs(
 
         _style_axis(
             ax,
-            y_label="Log gross wealth - log net wealth",
-            title=f"Cumulative transaction-cost drag: {portfolio_name}",
+            y_label="Log Gross Wealth - Log Net Wealth",
+            title=f"Cumulative Transaction-Cost Drag: {portfolio_name}",
             log_scale=False)
         _add_below_legend(fig, ax, ncol=1)
         plt.show()
@@ -7136,70 +8100,337 @@ def display_portfolio_performance_graphs(
         performance_records,
         ignore_index=True)
 
-    fig, ax = plt.subplots(
-        figsize=figsize,
-        facecolor="white")
-    shade_recessions(ax)
+    aggregate_weighting_order = [
+        weighting for weighting in ["EQ", "VW", "ALL"]
+        if weighting in set(all_performance["weighting"])]
 
-    for portfolio_index, (portfolio_name, _) in enumerate(file_items):
-        performance = all_performance[
-            all_performance["portfolio"] == portfolio_name]
-        color = palette[portfolio_index % len(palette)]
+    aggregate_return_specs = [
+        ("net_growth", "Net", "-"),
+        ("gross_growth", "Gross", "--")]
 
-        ax.plot(
-            performance["date"],
-            performance["net_growth"],
-            color=color,
-            linewidth=1.8,
-            linestyle="-",
-            label=f"{portfolio_name} net",
-            zorder=2)
+    for weighting in aggregate_weighting_order:
+        weighting_performance = all_performance[
+            all_performance["weighting"] == weighting]
 
-        ax.plot(
-            performance["date"],
-            performance["gross_growth"],
-            color=color,
-            linewidth=1.8,
-            linestyle="--",
-            label=f"{portfolio_name} gross",
-            zorder=2)
+        weighting_file_items = [
+            (portfolio_name, filename)
+            for portfolio_name, filename in file_items
+            if _infer_weighting(portfolio_name, filename) == weighting]
 
-    _style_axis(
-        ax,
-        y_label="Cumulative wealth (log scale)",
-        title="Aggregate portfolio performance",
-        log_scale=True)
-    _add_below_legend(fig, ax, ncol=3)
-    plt.show()
+        for return_col, return_label, linestyle in aggregate_return_specs:
+            fig, ax = plt.subplots(
+                figsize=figsize,
+                facecolor="white")
+            shade_recessions(ax)
 
-    fig, ax = plt.subplots(
-        figsize=figsize,
-        facecolor="white")
-    shade_recessions(ax)
+            for portfolio_index, (portfolio_name, _) in enumerate(weighting_file_items):
+                performance = weighting_performance[
+                    weighting_performance["portfolio"] == portfolio_name]
+                color = palette[portfolio_index % len(palette)]
 
-    for portfolio_index, (portfolio_name, _) in enumerate(file_items):
-        performance = all_performance[
-            all_performance["portfolio"] == portfolio_name]
-        color = palette[portfolio_index % len(palette)]
+                ax.plot(
+                    performance["date"],
+                    performance[return_col],
+                    color=color,
+                    linewidth=1.8,
+                    linestyle=linestyle,
+                    label=portfolio_name,
+                    zorder=2)
 
-        ax.plot(
-            performance["date"],
-            performance["transaction_cost_drag"],
-            color=color,
-            linewidth=1.8,
-            linestyle="-",
-            label=portfolio_name,
-            zorder=2)
+            _style_axis(
+                ax,
+                y_label="Cumulative Wealth (Log)",
+                title=f"Aggregate {weighting} {return_label.lower()} Portfolio Performance",
+                log_scale=True)
+            _add_below_legend(fig, ax, ncol=3)
+            plt.show()
 
-    _style_axis(
-        ax,
-        y_label="Log gross wealth - log net wealth",
-        title="Aggregate cumulative transaction-cost drag",
-        log_scale=False)
-    _add_below_legend(fig, ax, ncol=3)
-    plt.show()
+        fig, ax = plt.subplots(
+            figsize=figsize,
+            facecolor="white")
+        shade_recessions(ax)
+
+        for portfolio_index, (portfolio_name, _) in enumerate(weighting_file_items):
+            performance = weighting_performance[
+                weighting_performance["portfolio"] == portfolio_name]
+            color = palette[portfolio_index % len(palette)]
+
+            ax.plot(
+                performance["date"],
+                performance["transaction_cost_drag"],
+                color=color,
+                linewidth=1.8,
+                linestyle="-",
+                label=portfolio_name,
+                zorder=2)
+
+        _style_axis(
+            ax,
+            y_label="Log Gross Wealth - Log Net Wealth",
+            title=f"Aggregate {weighting} Cumulative Transaction-Cost Drag",
+            log_scale=False)
+        _add_below_legend(fig, ax, ncol=3)
+        plt.show()
 
     return None
+
+# Sample split figure, standard
+def display_expanding_sample_split_figure(
+    sample_end,
+    start_train="1970-01-01",
+    end_train="1986-12-31",
+    val_years=12,
+    figsize=(14, 8)):
+    """
+    Displays a figure for the fixed-sample split.
+    """
+    title_fontsize = 16
+    axis_label_fontsize = 18
+    tick_label_fontsize = 18
+    legend_fontsize = 18
+    bar_height = 0.70
+    train_color = "#4C78A8"
+    validation_color = "#F58518"
+    test_color = "#54A24B"
+    edge_color = "white"
+
+    sample_end_date = pd.to_datetime(sample_end)
+    train_start_date = pd.to_datetime(start_train)
+    train_end_date = pd.to_datetime(end_train)
+    split_records = []
+
+    while True:
+        val_start_date = train_end_date + YearBegin(1)
+        val_end_date = val_start_date + DateOffset(years=val_years) - pd.Timedelta(days=1)
+        test_start_date = val_end_date + MonthBegin(1)
+        test_end_date = test_start_date + YearEnd(1)
+
+        if test_end_date > sample_end_date:
+            break
+
+        split_records.append({
+            "iteration": len(split_records) + 1,
+            "train_start": train_start_date,
+            "train_end": train_end_date,
+            "validation_start": val_start_date,
+            "validation_end": val_end_date,
+            "test_start": test_start_date,
+            "test_end": test_end_date})
+
+        train_end_date += YearEnd(1)
+
+    split_schedule = pd.DataFrame(split_records)
+
+    fig, ax = plt.subplots(
+        figsize=figsize,
+        facecolor="white")
+
+    if split_schedule.empty:
+        ax.text(
+            0.5,
+            0.5,
+            "No valid expanding-window sample splits were created.",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+            fontsize=axis_label_fontsize)
+        ax.set_axis_off()
+        plt.show()
+        return fig, ax
+
+    y_positions = np.arange(len(split_schedule))[::-1]
+
+    for row_index, (_, row) in enumerate(split_schedule.iterrows()):
+        y_position = y_positions[row_index]
+
+        split_parts = [
+            (row["train_start"], row["train_end"], "Training", train_color),
+            (row["validation_start"], row["validation_end"], "Validation", validation_color),
+            (row["test_start"], row["test_end"], "Test", test_color)]
+
+        for start_date, end_date, label, color in split_parts:
+            start_num = mdates.date2num(start_date)
+            end_num = mdates.date2num(end_date + pd.Timedelta(days=1))
+
+            ax.barh(
+                y_position,
+                end_num - start_num,
+                left=start_num,
+                height=bar_height,
+                color=color,
+                edgecolor=edge_color,
+                linewidth=1.0,
+                label=label if row_index == 0 else None)
+
+    ax.set_title(
+        "Expanding-window split",
+        fontsize=title_fontsize,
+        pad=16)
+    ax.set_xlabel(
+        "Year",
+        fontsize=axis_label_fontsize)
+    ax.set_ylabel(
+        "Iteration",
+        fontsize=axis_label_fontsize)
+    ax.set_yticks(y_positions)
+    ax.set_yticklabels(
+        split_schedule["iteration"].astype(str),
+        fontsize=tick_label_fontsize)
+    ax.xaxis.set_major_locator(mdates.YearLocator(base=5))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+    ax.tick_params(
+        axis="x",
+        labelsize=tick_label_fontsize)
+    ax.grid(
+        axis="x",
+        linestyle="--",
+        linewidth=0.7,
+        alpha=0.35)
+    ax.set_axisbelow(True)
+    ax.legend(
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.12),
+        ncol=3,
+        frameon=False,
+        fontsize=legend_fontsize)
+
+    for spine in ["top", "right"]:
+        ax.spines[spine].set_visible(False)
+
+    fig.tight_layout()
+    plt.show()
+
+    return fig, ax
+
+# Sample split figures, alternative
+def display_fixed_window_sample_split_figure(
+    sample_end,
+    start_train="1970-01-01",
+    end_train="1986-12-31",
+    val_years=12,
+    figsize=(14, 8)):
+    """
+    Displays a figure for the fixed-sample split.
+    """
+    title_fontsize = 16
+    axis_label_fontsize = 18
+    tick_label_fontsize = 18
+    legend_fontsize = 18
+    bar_height = 0.70
+    train_color = "#4C78A8"
+    validation_color = "#F58518"
+    test_color = "#54A24B"
+    edge_color = "white"
+
+    sample_end_date = pd.to_datetime(sample_end)
+    train_start_date = pd.to_datetime(start_train)
+    train_end_date = pd.to_datetime(end_train)
+    train_window_years = train_end_date.year - train_start_date.year + 1
+    split_records = []
+
+    while True:
+        val_start_date = train_end_date + YearBegin(1)
+        val_end_date = val_start_date + DateOffset(years=val_years) - pd.Timedelta(days=1)
+        test_start_date = val_end_date + MonthBegin(1)
+        test_end_date = test_start_date + YearEnd(1)
+
+        if test_end_date > sample_end_date:
+            break
+
+        split_records.append({
+            "iteration": len(split_records) + 1,
+            "train_start": train_start_date,
+            "train_end": train_end_date,
+            "validation_start": val_start_date,
+            "validation_end": val_end_date,
+            "test_start": test_start_date,
+            "test_end": test_end_date})
+
+        train_start_date = train_start_date + YearBegin(1)
+        train_end_date = train_start_date + DateOffset(years=train_window_years) - pd.Timedelta(days=1)
+
+    split_schedule = pd.DataFrame(split_records)
+
+    fig, ax = plt.subplots(
+        figsize=figsize,
+        facecolor="white")
+
+    if split_schedule.empty:
+        ax.text(
+            0.5,
+            0.5,
+            "No valid fixed-window sample splits were created.",
+            ha="center",
+            va="center",
+            transform=ax.transAxes,
+            fontsize=axis_label_fontsize)
+        ax.set_axis_off()
+        plt.show()
+        return fig, ax
+
+    y_positions = np.arange(len(split_schedule))[::-1]
+
+    for row_index, (_, row) in enumerate(split_schedule.iterrows()):
+        y_position = y_positions[row_index]
+
+        split_parts = [
+            (row["train_start"], row["train_end"], "Training", train_color),
+            (row["validation_start"], row["validation_end"], "Validation", validation_color),
+            (row["test_start"], row["test_end"], "Test", test_color)]
+
+        for start_date, end_date, label, color in split_parts:
+            start_num = mdates.date2num(start_date)
+            end_num = mdates.date2num(end_date + pd.Timedelta(days=1))
+
+            ax.barh(
+                y_position,
+                end_num - start_num,
+                left=start_num,
+                height=bar_height,
+                color=color,
+                edgecolor=edge_color,
+                linewidth=1.0,
+                label=label if row_index == 0 else None)
+
+    ax.set_title(
+        "Fixed-window split",
+        fontsize=title_fontsize,
+        pad=16)
+    ax.set_xlabel(
+        "Year",
+        fontsize=axis_label_fontsize)
+    ax.set_ylabel(
+        "Iteration",
+        fontsize=axis_label_fontsize)
+    ax.set_yticks(y_positions)
+    ax.set_yticklabels(
+        split_schedule["iteration"].astype(str),
+        fontsize=tick_label_fontsize)
+    ax.xaxis.set_major_locator(mdates.YearLocator(base=5))
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+    ax.tick_params(
+        axis="x",
+        labelsize=tick_label_fontsize)
+    ax.grid(
+        axis="x",
+        linestyle="--",
+        linewidth=0.7,
+        alpha=0.35)
+    ax.set_axisbelow(True)
+    ax.legend(
+        loc="upper center",
+        bbox_to_anchor=(0.5, -0.12),
+        ncol=3,
+        frameon=False,
+        fontsize=legend_fontsize)
+
+    for spine in ["top", "right"]:
+        ax.spines[spine].set_visible(False)
+
+    fig.tight_layout()
+    plt.show()
+
+    return fig, ax
 
 # ==============================================================================
 # ROBUSTNESS
@@ -7895,6 +9126,67 @@ linear_ensemble_predictions, linear_ensemble_r2 = run_linear_ensemble_model(
      benchmark_pred=None,
      print_r2=True)
 
+"""FFNN"""
+
+# ==============================================================================
+# RUN FFNN MODEL
+# ==============================================================================
+(ffnn_predictions,
+ ffnn_variable_importance_average,
+ ffnn_variable_importance_time_varying,
+ ffnn_number_of_features,
+ ffnn_r2) = run_ffnn_model(
+     input_filename="Processed data/df_processed.parquet",
+     hidden_layers_grid=(1, 2, 3, 4, 5),
+     predictions_filename=[
+         "Model output/FFNN1_predictions.parquet",
+         "Model output/FFNN2_predictions.parquet",
+         "Model output/FFNN3_predictions.parquet",
+         "Model output/FFNN4_predictions.parquet",
+         "Model output/FFNN5_predictions.parquet"],
+     vi_average_filename=[
+         "Model output/FFNN1_variable_importance_average.parquet",
+         "Model output/FFNN2_variable_importance_average.parquet",
+         "Model output/FFNN3_variable_importance_average.parquet",
+         "Model output/FFNN4_variable_importance_average.parquet",
+         "Model output/FFNN5_variable_importance_average.parquet"],
+     vi_time_varying_filename=[
+         "Model output/FFNN1_variable_importance_time_varying.parquet",
+         "Model output/FFNN2_variable_importance_time_varying.parquet",
+         "Model output/FFNN3_variable_importance_time_varying.parquet",
+         "Model output/FFNN4_variable_importance_time_varying.parquet",
+         "Model output/FFNN5_variable_importance_time_varying.parquet"],
+     features_filename=[
+         "Model output/FFNN1_number_of_features.parquet",
+         "Model output/FFNN2_number_of_features.parquet",
+         "Model output/FFNN3_number_of_features.parquet",
+         "Model output/FFNN4_number_of_features.parquet",
+         "Model output/FFNN5_number_of_features.parquet"],
+     model_output_dir="Model output",
+     permno_col="permno",
+     date_col="date",
+     y_true_col="ret_exc",
+     characteristic_cols=char_cols,
+     universe="all",
+     me_col="me",
+     universe_size=1000,
+     industry_code_func=sic_industry_code_for_demeaning,
+     split_func=rolling_train_val_test_yearly,
+     start_train="1970-01-01",
+     end_train="1986-12-31",
+     val_years=12,
+     hidden_layer_units=(32, 16, 8, 4, 2),
+     l1_penalty_grid=(1e-5,),
+     learning_rate_grid=(0.001,),
+     batch_size=10000,
+     epochs=50,
+     patience=3,
+     ensemble=3,
+     benchmark_pred=None,
+     random_state=0,
+     device="cuda",
+     print_r2=True)
+
 """Non-linear ensemble"""
 
 # ==============================================================================
@@ -7903,7 +9195,12 @@ linear_ensemble_predictions, linear_ensemble_r2 = run_linear_ensemble_model(
 nonlinear_ensemble_predictions, nonlinear_ensemble_r2 = run_nonlinear_ensemble_model(
     nonlinear_model_prediction_files={
         "GBRT": "Model output/GBRT_predictions.parquet",
-        "RF": "Model output/RF_predictions.parquet"},
+        "RF": "Model output/RF_predictions.parquet",
+        "FFNN1" : "Model output/FFNN1_predictions.parquet",
+        "FFNN2" : "Model output/FFNN2_predictions.parquet",
+        "FFNN3" : "Model output/FFNN3_predictions.parquet",
+        "FFNN4" : "Model output/FFNN4_predictions.parquet",
+        "FFNN5" : "Model output/FFNN5_predictions.parquet"},
     output_filename="Model output/Non_linear_ensemble_predictions.parquet",
     model_output_dir="Model output",
     benchmark_pred=None,
@@ -8153,6 +9450,67 @@ linear_ensemble_predictions, linear_ensemble_r2 = run_linear_ensemble_model(
      benchmark_pred=None,
      print_r2=True)
 
+"""FFNN"""
+
+# ==============================================================================
+# RUN FFNN MODEL
+# ==============================================================================
+(ffnn_predictions_winsorized,
+ ffnn_variable_importance_average_winsorized,
+ ffnn_variable_importance_time_varying_winsorized,
+ ffnn_number_of_features_winsorized,
+ ffnn_r2) = run_ffnn_model(
+     input_filename="Processed data/df_processed_winsorized.parquet",
+     hidden_layers_grid=(1, 2, 3, 4, 5),
+     predictions_filename=[
+         "Model output winsorized/FFNN1_predictions_winsorized.parquet",
+         "Model output winsorized/FFNN2_predictions_winsorized.parquet",
+         "Model output winsorized/FFNN3_predictions_winsorized.parquet",
+         "Model output winsorized/FFNN4_predictions_winsorized.parquet",
+         "Model output winsorized/FFNN5_predictions_winsorized.parquet"],
+     vi_average_filename=[
+         "Model output winsorized/FFNN1_variable_importance_average_winsorized.parquet",
+         "Model output winsorized/FFNN2_variable_importance_average_winsorized.parquet",
+         "Model output winsorized/FFNN3_variable_importance_average_winsorized.parquet",
+         "Model output winsorized/FFNN4_variable_importance_average_winsorized.parquet",
+         "Model output winsorized/FFNN5_variable_importance_average_winsorized.parquet"],
+     vi_time_varying_filename=[
+         "Model output winsorized/FFNN1_variable_importance_time_varying_winsorized.parquet",
+         "Model output winsorized/FFNN2_variable_importance_time_varying_winsorized.parquet",
+         "Model output winsorized/FFNN3_variable_importance_time_varying_winsorized.parquet",
+         "Model output winsorized/FFNN4_variable_importance_time_varying_winsorized.parquet",
+         "Model output winsorized/FFNN5_variable_importance_time_varying_winsorized.parquet"],
+     features_filename=[
+         "Model output winsorized/FFNN1_number_of_features_winsorized.parquet",
+         "Model output winsorized/FFNN2_number_of_features_winsorized.parquet",
+         "Model output winsorized/FFNN3_number_of_features_winsorized.parquet",
+         "Model output winsorized/FFNN4_number_of_features_winsorized.parquet",
+         "Model output winsorized/FFNN5_number_of_features_winsorized.parquet"],
+     model_output_dir="Model output winsorized",
+     permno_col="permno",
+     date_col="date",
+     y_true_col="ret_exc",
+     characteristic_cols=char_cols,
+     universe="all",
+     me_col="me",
+     universe_size=1000,
+     industry_code_func=sic_industry_code_for_demeaning,
+     split_func=rolling_train_val_test_yearly,
+     start_train="1970-01-01",
+     end_train="1986-12-31",
+     val_years=12,
+     hidden_layer_units=(32, 16, 8, 4, 2),
+     l1_penalty_grid=(1e-5,),
+     learning_rate_grid=(0.001,),
+     batch_size=10000,
+     epochs=50,
+     patience=3,
+     ensemble=3,
+     benchmark_pred=None,
+     random_state=0,
+     device="cuda",
+     print_r2=True)
+
 """Non-linear ensemble"""
 
 # ==============================================================================
@@ -8161,7 +9519,12 @@ linear_ensemble_predictions, linear_ensemble_r2 = run_linear_ensemble_model(
 nonlinear_ensemble_predictions, nonlinear_ensemble_r2 = run_nonlinear_ensemble_model(
     nonlinear_model_prediction_files={
         "GBRT": "Model output winsorized/GBRT_predictions_winsorized.parquet",
-        "RF": "Model output winsorized/RF_predictions_winsorized.parquet"},
+        "RF": "Model output winsorized/RF_predictions_winsorized.parquet",
+        "FFNN1" : "Model output winsorized/FFNN1_predictions_winsorized.parquet",
+        "FFNN2" : "Model output winsorized/FFNN2_predictions_winsorized.parquet",
+        "FFNN3" : "Model output winsorized/FFNN3_predictions_winsorized.parquet",
+        "FFNN4" : "Model output winsorized/FFNN4_predictions_winsorized.parquet",
+        "FFNN5" : "Model output winsorized/FFNN5_predictions_winsorized.parquet"},
     output_filename="Model output winsorized/Non_linear_ensemble_predictions_winsorized.parquet",
     model_output_dir="Model output winsorized",
     benchmark_pred=None,
@@ -8411,6 +9774,67 @@ linear_ensemble_predictions, linear_ensemble_r2 = run_linear_ensemble_model(
      benchmark_pred=None,
      print_r2=True)
 
+"""FFNN"""
+
+# ==============================================================================
+# RUN FFNN MODEL
+# ==============================================================================
+(ffnn_predictions_alternative_data,
+ ffnn_variable_importance_average_alternative_data,
+ ffnn_variable_importance_time_varying_alternative_data,
+ ffnn_number_of_features_alternative_data,
+ ffnn_r2) = run_ffnn_model(
+     input_filename="Processed data/df_processed_alternative_data.parquet",
+     hidden_layers_grid=(1, 2, 3, 4, 5),
+     predictions_filename=[
+         "Model output alternative data/FFNN1_predictions_alternative_data.parquet",
+         "Model output alternative data/FFNN2_predictions_alternative_data.parquet",
+         "Model output alternative data/FFNN3_predictions_alternative_data.parquet",
+         "Model output alternative data/FFNN4_predictions_alternative_data.parquet",
+         "Model output alternative data/FFNN5_predictions_alternative_data.parquet"],
+     vi_average_filename=[
+         "Model output alternative data/FFNN1_variable_importance_average_alternative_data.parquet",
+         "Model output alternative data/FFNN2_variable_importance_average_alternative_data.parquet",
+         "Model output alternative data/FFNN3_variable_importance_average_alternative_data.parquet",
+         "Model output alternative data/FFNN4_variable_importance_average_alternative_data.parquet",
+         "Model output alternative data/FFNN5_variable_importance_average_alternative_data.parquet"],
+     vi_time_varying_filename=[
+         "Model output alternative data/FFNN1_variable_importance_time_varying_alternative_data.parquet",
+         "Model output alternative data/FFNN2_variable_importance_time_varying_alternative_data.parquet",
+         "Model output alternative data/FFNN3_variable_importance_time_varying_alternative_data.parquet",
+         "Model output alternative data/FFNN4_variable_importance_time_varying_alternative_data.parquet",
+         "Model output alternative data/FFNN5_variable_importance_time_varying_alternative_data.parquet"],
+     features_filename=[
+         "Model output alternative data/FFNN1_number_of_features_alternative_data.parquet",
+         "Model output alternative data/FFNN2_number_of_features_alternative_data.parquet",
+         "Model output alternative data/FFNN3_number_of_features_alternative_data.parquet",
+         "Model output alternative data/FFNN4_number_of_features_alternative_data.parquet",
+         "Model output alternative data/FFNN5_number_of_features_alternative_data.parquet"],
+     model_output_dir="Model output alternative data",
+     permno_col="permno",
+     date_col="date",
+     y_true_col="ret_exc",
+     characteristic_cols=char_cols,
+     universe="all",
+     me_col="me",
+     universe_size=1000,
+     industry_code_func=sic_industry_code_for_demeaning,
+     split_func=rolling_train_val_test_yearly,
+     start_train="1970-01-01",
+     end_train="1986-12-31",
+     val_years=12,
+     hidden_layer_units=(32, 16, 8, 4, 2),
+     l1_penalty_grid=(1e-5,),
+     learning_rate_grid=(0.001,),
+     batch_size=10000,
+     epochs=50,
+     patience=3,
+     ensemble=3,
+     benchmark_pred=None,
+     random_state=0,
+     device="cuda",
+     print_r2=True)
+
 """Non-linear ensemble"""
 
 # ==============================================================================
@@ -8419,7 +9843,12 @@ linear_ensemble_predictions, linear_ensemble_r2 = run_linear_ensemble_model(
 nonlinear_ensemble_predictions, nonlinear_ensemble_r2 = run_nonlinear_ensemble_model(
     nonlinear_model_prediction_files={
         "GBRT": "Model output alternative data/GBRT_predictions_alternative_data.parquet",
-        "RF": "Model output alternative data/RF_predictions_alternative_data.parquet"},
+        "RF": "Model output alternative data/RF_predictions_alternative_data.parquet",
+        "FFNN1" : "Model output alternative data/FFNN1_predictions_alternative_data.parquet",
+        "FFNN2" : "Model output alternative data/FFNN2_predictions_alternative_data.parquet",
+        "FFNN3" : "Model output alternative data/FFNN3_predictions_alternative_data.parquet",
+        "FFNN4" : "Model output alternative data/FFNN4_predictions_alternative_data.parquet",
+        "FFNN5" : "Model output alternative data/FFNN5_predictions_alternative_data.parquet"},
     output_filename="Model output alternative data/Non_linear_ensemble_predictions_alternative_data.parquet",
     model_output_dir="Model output alternative data",
     benchmark_pred=None,
@@ -8669,6 +10098,67 @@ linear_ensemble_predictions, linear_ensemble_r2 = run_linear_ensemble_model(
      benchmark_pred=None,
      print_r2=True)
 
+"""FFNN"""
+
+# ==============================================================================
+# RUN FFNN MODEL
+# ==============================================================================
+(ffnn_predictions_top,
+ ffnn_variable_importance_average_top,
+ ffnn_variable_importance_time_varying_top,
+ ffnn_number_of_features_top,
+ ffnn_r2) = run_ffnn_model(
+     input_filename="Processed data/df_processed.parquet",
+     hidden_layers_grid=(1, 2, 3, 4, 5),
+     predictions_filename=[
+         "Model output top/FFNN1_predictions_top.parquet",
+         "Model output top/FFNN2_predictions_top.parquet",
+         "Model output top/FFNN3_predictions_top.parquet",
+         "Model output top/FFNN4_predictions_top.parquet",
+         "Model output top/FFNN5_predictions_top.parquet"],
+     vi_average_filename=[
+         "Model output top/FFNN1_variable_importance_average_top.parquet",
+         "Model output top/FFNN2_variable_importance_average_top.parquet",
+         "Model output top/FFNN3_variable_importance_average_top.parquet",
+         "Model output top/FFNN4_variable_importance_average_top.parquet",
+         "Model output top/FFNN5_variable_importance_average_top.parquet"],
+     vi_time_varying_filename=[
+         "Model output top/FFNN1_variable_importance_time_varying_top.parquet",
+         "Model output top/FFNN2_variable_importance_time_varying_top.parquet",
+         "Model output top/FFNN3_variable_importance_time_varying_top.parquet",
+         "Model output top/FFNN4_variable_importance_time_varying_top.parquet",
+         "Model output top/FFNN5_variable_importance_time_varying_top.parquet"],
+     features_filename=[
+         "Model output top/FFNN1_number_of_features_top.parquet",
+         "Model output top/FFNN2_number_of_features_top.parquet",
+         "Model output top/FFNN3_number_of_features_top.parquet",
+         "Model output top/FFNN4_number_of_features_top.parquet",
+         "Model output top/FFNN5_number_of_features_top.parquet"],
+     model_output_dir="Model output top",
+     permno_col="permno",
+     date_col="date",
+     y_true_col="ret_exc",
+     characteristic_cols=char_cols,
+     universe="top",
+     me_col="me",
+     universe_size=1000,
+     industry_code_func=sic_industry_code_for_demeaning,
+     split_func=rolling_train_val_test_yearly,
+     start_train="1970-01-01",
+     end_train="1986-12-31",
+     val_years=12,
+     hidden_layer_units=(32, 16, 8, 4, 2),
+     l1_penalty_grid=(1e-5,),
+     learning_rate_grid=(0.001,),
+     batch_size=10000,
+     epochs=50,
+     patience=3,
+     ensemble=3,
+     benchmark_pred=None,
+     random_state=0,
+     device="cuda",
+     print_r2=True)
+
 """Non-linear ensemble"""
 
 # ==============================================================================
@@ -8677,7 +10167,12 @@ linear_ensemble_predictions, linear_ensemble_r2 = run_linear_ensemble_model(
 nonlinear_ensemble_predictions, nonlinear_ensemble_r2 = run_nonlinear_ensemble_model(
     nonlinear_model_prediction_files={
         "GBRT": "Model output top/GBRT_predictions_top.parquet",
-        "RF": "Model output top/RF_predictions_top.parquet"},
+        "RF": "Model output top/RF_predictions_top.parquet",
+        "FFNN1" : "Model output top/FFNN1_predictions_top.parquet",
+        "FFNN2" : "Model output top/FFNN2_predictions_top.parquet",
+        "FFNN3" : "Model output top/FFNN3_predictions_top.parquet",
+        "FFNN4" : "Model output top/FFNN4_predictions_top.parquet",
+        "FFNN5" : "Model output top/FFNN5_predictions_top.parquet"},
     output_filename="Model output top/Non_linear_ensemble_predictions_top.parquet",
     model_output_dir="Model output top",
     benchmark_pred=None,
@@ -8927,6 +10422,67 @@ linear_ensemble_predictions, linear_ensemble_r2 = run_linear_ensemble_model(
      benchmark_pred=None,
      print_r2=True)
 
+"""FFNN"""
+
+# ==============================================================================
+# RUN FFNN MODEL
+# ==============================================================================
+(ffnn_predictions_bottom,
+ ffnn_variable_importance_average_bottom,
+ ffnn_variable_importance_time_varying_bottom,
+ ffnn_number_of_features_bottom,
+ ffnn_r2) = run_ffnn_model(
+     input_filename="Processed data/df_processed.parquet",
+     hidden_layers_grid=(1, 2, 3, 4, 5),
+     predictions_filename=[
+         "Model output bottom/FFNN1_predictions_bottom.parquet",
+         "Model output bottom/FFNN2_predictions_bottom.parquet",
+         "Model output bottom/FFNN3_predictions_bottom.parquet",
+         "Model output bottom/FFNN4_predictions_bottom.parquet",
+         "Model output bottom/FFNN5_predictions_bottom.parquet"],
+     vi_average_filename=[
+         "Model output bottom/FFNN1_variable_importance_average_bottom.parquet",
+         "Model output bottom/FFNN2_variable_importance_average_bottom.parquet",
+         "Model output bottom/FFNN3_variable_importance_average_bottom.parquet",
+         "Model output bottom/FFNN4_variable_importance_average_bottom.parquet",
+         "Model output bottom/FFNN5_variable_importance_average_bottom.parquet"],
+     vi_time_varying_filename=[
+         "Model output bottom/FFNN1_variable_importance_time_varying_bottom.parquet",
+         "Model output bottom/FFNN2_variable_importance_time_varying_bottom.parquet",
+         "Model output bottom/FFNN3_variable_importance_time_varying_bottom.parquet",
+         "Model output bottom/FFNN4_variable_importance_time_varying_bottom.parquet",
+         "Model output bottom/FFNN5_variable_importance_time_varying_bottom.parquet"],
+     features_filename=[
+         "Model output bottom/FFNN1_number_of_features_bottom.parquet",
+         "Model output bottom/FFNN2_number_of_features_bottom.parquet",
+         "Model output bottom/FFNN3_number_of_features_bottom.parquet",
+         "Model output bottom/FFNN4_number_of_features_bottom.parquet",
+         "Model output bottom/FFNN5_number_of_features_bottom.parquet"],
+     model_output_dir="Model output bottom",
+     permno_col="permno",
+     date_col="date",
+     y_true_col="ret_exc",
+     characteristic_cols=char_cols,
+     universe="bottom",
+     me_col="me",
+     universe_size=1000,
+     industry_code_func=sic_industry_code_for_demeaning,
+     split_func=rolling_train_val_test_yearly,
+     start_train="1970-01-01",
+     end_train="1986-12-31",
+     val_years=12,
+     hidden_layer_units=(32, 16, 8, 4, 2),
+     l1_penalty_grid=(1e-5,),
+     learning_rate_grid=(0.001,),
+     batch_size=10000,
+     epochs=50,
+     patience=3,
+     ensemble=3,
+     benchmark_pred=None,
+     random_state=0,
+     device="cuda",
+     print_r2=True)
+
 """Non-linear ensemble"""
 
 # ==============================================================================
@@ -8935,7 +10491,12 @@ linear_ensemble_predictions, linear_ensemble_r2 = run_linear_ensemble_model(
 nonlinear_ensemble_predictions, nonlinear_ensemble_r2 = run_nonlinear_ensemble_model(
     nonlinear_model_prediction_files={
         "GBRT": "Model output bottom/GBRT_predictions_bottom.parquet",
-        "RF": "Model output bottom/RF_predictions_bottom.parquet"},
+        "RF": "Model output bottom/RF_predictions_bottom.parquet",
+        "FFNN1" : "Model output bottom/FFNN1_predictions_bottom.parquet",
+        "FFNN2" : "Model output bottom/FFNN2_predictions_bottom.parquet",
+        "FFNN3" : "Model output bottom/FFNN3_predictions_bottom.parquet",
+        "FFNN4" : "Model output bottom/FFNN4_predictions_bottom.parquet",
+        "FFNN5" : "Model output bottom/FFNN5_predictions_bottom.parquet"},
     output_filename="Model output bottom/Non_linear_ensemble_predictions_bottom.parquet",
     model_output_dir="Model output bottom",
     benchmark_pred=None,
@@ -9185,6 +10746,67 @@ linear_ensemble_predictions, linear_ensemble_r2 = run_linear_ensemble_model(
      benchmark_pred=None,
      print_r2=True)
 
+"""FFNN"""
+
+# ==============================================================================
+# RUN FFNN MODEL
+# ==============================================================================
+(ffnn_predictions_alternative_industries,
+ ffnn_variable_importance_average_alternative_industries,
+ ffnn_variable_importance_time_varying_alternative_industries,
+ ffnn_number_of_features_alternative_industries,
+ ffnn_r2) = run_ffnn_model(
+     input_filename="Processed data/df_processed_alternative_industries.parquet",
+     hidden_layers_grid=(1, 2, 3, 4, 5),
+     predictions_filename=[
+         "Model output alternative industries/FFNN1_predictions_alternative_industries.parquet",
+         "Model output alternative industries/FFNN2_predictions_alternative_industries.parquet",
+         "Model output alternative industries/FFNN3_predictions_alternative_industries.parquet",
+         "Model output alternative industries/FFNN4_predictions_alternative_industries.parquet",
+         "Model output alternative industries/FFNN5_predictions_alternative_industries.parquet"],
+     vi_average_filename=[
+         "Model output alternative industries/FFNN1_variable_importance_average_alternative_industries.parquet",
+         "Model output alternative industries/FFNN2_variable_importance_average_alternative_industries.parquet",
+         "Model output alternative industries/FFNN3_variable_importance_average_alternative_industries.parquet",
+         "Model output alternative industries/FFNN4_variable_importance_average_alternative_industries.parquet",
+         "Model output alternative industries/FFNN5_variable_importance_average_alternative_industries.parquet"],
+     vi_time_varying_filename=[
+         "Model output alternative industries/FFNN1_variable_importance_time_varying_alternative_industries.parquet",
+         "Model output alternative industries/FFNN2_variable_importance_time_varying_alternative_industries.parquet",
+         "Model output alternative industries/FFNN3_variable_importance_time_varying_alternative_industries.parquet",
+         "Model output alternative industries/FFNN4_variable_importance_time_varying_alternative_industries.parquet",
+         "Model output alternative industries/FFNN5_variable_importance_time_varying_alternative_industries.parquet"],
+     features_filename=[
+         "Model output alternative industries/FFNN1_number_of_features_alternative_industries.parquet",
+         "Model output alternative industries/FFNN2_number_of_features_alternative_industries.parquet",
+         "Model output alternative industries/FFNN3_number_of_features_alternative_industries.parquet",
+         "Model output alternative industries/FFNN4_number_of_features_alternative_industries.parquet",
+         "Model output alternative industries/FFNN5_number_of_features_alternative_industries.parquet"],
+     model_output_dir="Model output alternative industries",
+     permno_col="permno",
+     date_col="date",
+     y_true_col="ret_exc",
+     characteristic_cols=char_cols,
+     universe="all",
+     me_col="me",
+     universe_size=1000,
+     industry_code_func=ff49_industry_code_for_demeaning,
+     split_func=rolling_train_val_test_yearly,
+     start_train="1970-01-01",
+     end_train="1986-12-31",
+     val_years=12,
+     hidden_layer_units=(32, 16, 8, 4, 2),
+     l1_penalty_grid=(1e-5,),
+     learning_rate_grid=(0.001,),
+     batch_size=10000,
+     epochs=50,
+     patience=3,
+     ensemble=3,
+     benchmark_pred=None,
+     random_state=0,
+     device="cuda",
+     print_r2=True)
+
 """Non-linear ensemble"""
 
 # ==============================================================================
@@ -9193,7 +10815,12 @@ linear_ensemble_predictions, linear_ensemble_r2 = run_linear_ensemble_model(
 nonlinear_ensemble_predictions, nonlinear_ensemble_r2 = run_nonlinear_ensemble_model(
     nonlinear_model_prediction_files={
         "GBRT": "Model output alternative industries/GBRT_predictions_alternative_industries.parquet",
-        "RF": "Model output alternative industries/RF_predictions_alternative_industries.parquet"},
+        "RF": "Model output alternative industries/RF_predictions_alternative_industries.parquet",
+        "FFNN1" : "Model output alternative industries/FFNN1_predictions_alternative_industries.parquet",
+        "FFNN2" : "Model output alternative industries/FFNN2_predictions_alternative_industries.parquet",
+        "FFNN3" : "Model output alternative industries/FFNN3_predictions_alternative_industries.parquet",
+        "FFNN4" : "Model output alternative industries/FFNN4_predictions_alternative_industries.parquet",
+        "FFNN5" : "Model output alternative industries/FFNN5_predictions_alternative_industries.parquet"},
     output_filename="Model output alternative industries/Non_linear_ensemble_predictions_alternative_industries.parquet",
     model_output_dir="Model output alternative industries",
     benchmark_pred=None,
@@ -9443,6 +11070,67 @@ linear_ensemble_predictions_alternative_sample_split, linear_ensemble_r2 = run_l
      benchmark_pred=None,
      print_r2=True)
 
+"""FFNN"""
+
+# ==============================================================================
+# RUN FFNN MODEL
+# ==============================================================================
+(ffnn_predictions_alternative_sample_split,
+ ffnn_variable_importance_average_alternative_sample_split,
+ ffnn_variable_importance_time_varying_alternative_sample_split,
+ ffnn_number_of_features_alternative_sample_split,
+ ffnn_r2) = run_ffnn_model(
+     input_filename="Processed data/df_processed.parquet",
+     hidden_layers_grid=(1, 2, 3, 4, 5),
+     predictions_filename=[
+         "Model output alternative sample split/FFNN1_predictions_alternative_sample_split.parquet",
+         "Model output alternative sample split/FFNN2_predictions_alternative_sample_split.parquet",
+         "Model output alternative sample split/FFNN3_predictions_alternative_sample_split.parquet",
+         "Model output alternative sample split/FFNN4_predictions_alternative_sample_split.parquet",
+         "Model output alternative sample split/FFNN5_predictions_alternative_sample_split.parquet"],
+     vi_average_filename=[
+         "Model output alternative sample split/FFNN1_variable_importance_average_alternative_sample_split.parquet",
+         "Model output alternative sample split/FFNN2_variable_importance_average_alternative_sample_split.parquet",
+         "Model output alternative sample split/FFNN3_variable_importance_average_alternative_sample_split.parquet",
+         "Model output alternative sample split/FFNN4_variable_importance_average_alternative_sample_split.parquet",
+         "Model output alternative sample split/FFNN5_variable_importance_average_alternative_sample_split.parquet"],
+     vi_time_varying_filename=[
+         "Model output alternative sample split/FFNN1_variable_importance_time_varying_alternative_sample_split.parquet",
+         "Model output alternative sample split/FFNN2_variable_importance_time_varying_alternative_sample_split.parquet",
+         "Model output alternative sample split/FFNN3_variable_importance_time_varying_alternative_sample_split.parquet",
+         "Model output alternative sample split/FFNN4_variable_importance_time_varying_alternative_sample_split.parquet",
+         "Model output alternative sample split/FFNN5_variable_importance_time_varying_alternative_sample_split.parquet"],
+     features_filename=[
+         "Model output alternative sample split/FFNN1_number_of_features_alternative_sample_split.parquet",
+         "Model output alternative sample split/FFNN2_number_of_features_alternative_sample_split.parquet",
+         "Model output alternative sample split/FFNN3_number_of_features_alternative_sample_split.parquet",
+         "Model output alternative sample split/FFNN4_number_of_features_alternative_sample_split.parquet",
+         "Model output alternative sample split/FFNN5_number_of_features_alternative_sample_split.parquet"],
+     model_output_dir="Model output alternative sample split",
+     permno_col="permno",
+     date_col="date",
+     y_true_col="ret_exc",
+     characteristic_cols=char_cols,
+     universe="all",
+     me_col="me",
+     universe_size=1000,
+     industry_code_func=sic_industry_code_for_demeaning,
+     split_func=rolling_train_val_test_yearly_fixed_window,
+     start_train="1970-01-01",
+     end_train="1986-12-31",
+     val_years=12,
+     hidden_layer_units=(32, 16, 8, 4, 2),
+     l1_penalty_grid=(1e-5,),
+     learning_rate_grid=(0.001,),
+     batch_size=10000,
+     epochs=50,
+     patience=3,
+     ensemble=3,
+     benchmark_pred=None,
+     random_state=0,
+     device="cuda",
+     print_r2=True)
+
 """Non-linear ensemble"""
 
 # ==============================================================================
@@ -9451,7 +11139,12 @@ linear_ensemble_predictions_alternative_sample_split, linear_ensemble_r2 = run_l
 nonlinear_ensemble_predictions_alternative_sample_split, nonlinear_ensemble_r2 = run_nonlinear_ensemble_model(
     nonlinear_model_prediction_files={
         "GBRT": "Model output alternative sample split/GBRT_predictions_alternative_sample_split.parquet",
-        "RF": "Model output alternative sample split/RF_predictions_alternative_sample_split.parquet"},
+        "RF": "Model output alternative sample split/RF_predictions_alternative_sample_split.parquet",
+        "FFNN1" : "Model output alternative sample split/FFNN1_predictions_alternative_sample_split.parquet",
+        "FFNN2" : "Model output alternative sample split/FFNN2_predictions_alternative_sample_split.parquet",
+        "FFNN3" : "Model output alternative sample split/FFNN3_predictions_alternative_sample_split.parquet",
+        "FFNN4" : "Model output alternative sample split/FFNN4_predictions_alternative_sample_split.parquet",
+        "FFNN5" : "Model output alternative sample split/FFNN5_predictions_alternative_sample_split.parquet"},
     output_filename="Model output alternative sample split/Non_linear_ensemble_predictions_alternative_sample_split.parquet",
     model_output_dir="Model output alternative sample split",
     benchmark_pred=None,
@@ -9472,6 +11165,11 @@ cw_results = model_level_clarke_west_statistics(
         "Linear_ensemble": "Model output/Linear_ensemble_predictions.parquet",
         "GBRT": "Model output/GBRT_predictions.parquet",
         "RF": "Model output/RF_predictions.parquet",
+        "FFNN1": "Model output/FFNN1_predictions.parquet",
+        "FFNN2": "Model output/FFNN2_predictions.parquet",
+        "FFNN3": "Model output/FFNN3_predictions.parquet",
+        "FFNN4": "Model output/FFNN4_predictions.parquet",
+        "FFNN5": "Model output/FFNN5_predictions.parquet",
         "Non_linear_ensemble": "Model output/Non_linear_ensemble_predictions.parquet"},
     y_true_col="y_true",
     y_pred_col="y_pred",
@@ -9490,6 +11188,11 @@ cw_results = model_level_clarke_west_statistics(
         "Linear_ensemble": "Model output winsorized/Linear_ensemble_predictions_winsorized.parquet",
         "GBRT": "Model output winsorized/GBRT_predictions_winsorized.parquet",
         "RF": "Model output winsorized/RF_predictions_winsorized.parquet",
+        "FFNN1": "Model output winsorized/FFNN1_predictions_winsorized.parquet",
+        "FFNN2": "Model output winsorized/FFNN2_predictions_winsorized.parquet",
+        "FFNN3": "Model output winsorized/FFNN3_predictions_winsorized.parquet",
+        "FFNN4": "Model output winsorized/FFNN4_predictions_winsorized.parquet",
+        "FFNN5": "Model output winsorized/FFNN5_predictions_winsorized.parquet",
         "Non_linear_ensemble": "Model output winsorized/Non_linear_ensemble_predictions_winsorized.parquet"},
     y_true_col="y_true",
     y_pred_col="y_pred",
@@ -9508,6 +11211,11 @@ cw_results = model_level_clarke_west_statistics(
         "Linear_ensemble": "Model output alternative data/Linear_ensemble_predictions_alternative_data.parquet",
         "GBRT": "Model output alternative data/GBRT_predictions_alternative_data.parquet",
         "RF": "Model output alternative data/RF_predictions_alternative_data.parquet",
+        "FFNN1": "Model output alternative data/FFNN1_predictions_alternative_data.parquet",
+        "FFNN2": "Model output alternative data/FFNN2_predictions_alternative_data.parquet",
+        "FFNN3": "Model output alternative data/FFNN3_predictions_alternative_data.parquet",
+        "FFNN4": "Model output alternative data/FFNN4_predictions_alternative_data.parquet",
+        "FFNN5": "Model output alternative data/FFNN5_predictions_alternative_data.parquet",
         "Non_linear_ensemble": "Model output alternative data/Non_linear_ensemble_predictions_alternative_data.parquet"},
     y_true_col="y_true",
     y_pred_col="y_pred",
@@ -9526,6 +11234,11 @@ cw_results = model_level_clarke_west_statistics(
         "Linear_ensemble": "Model output top/Linear_ensemble_predictions_top.parquet",
         "GBRT": "Model output top/GBRT_predictions_top.parquet",
         "RF": "Model output top/RF_predictions_top.parquet",
+        "FFNN1": "Model output top/FFNN1_predictions_top.parquet",
+        "FFNN2": "Model output top/FFNN2_predictions_top.parquet",
+        "FFNN3": "Model output top/FFNN3_predictions_top.parquet",
+        "FFNN4": "Model output top/FFNN4_predictions_top.parquet",
+        "FFNN5": "Model output top/FFNN5_predictions_top.parquet",
         "Non_linear_ensemble": "Model output top/Non_linear_ensemble_predictions_top.parquet"},
     y_true_col="y_true",
     y_pred_col="y_pred",
@@ -9544,6 +11257,11 @@ cw_results = model_level_clarke_west_statistics(
         "Linear_ensemble": "Model output bottom/Linear_ensemble_predictions_bottom.parquet",
         "GBRT": "Model output bottom/GBRT_predictions_bottom.parquet",
         "RF": "Model output bottom/RF_predictions_bottom.parquet",
+        "FFNN1": "Model output bottom/FFNN1_predictions_bottom.parquet",
+        "FFNN2": "Model output bottom/FFNN2_predictions_bottom.parquet",
+        "FFNN3": "Model output bottom/FFNN3_predictions_bottom.parquet",
+        "FFNN4": "Model output bottom/FFNN4_predictions_bottom.parquet",
+        "FFNN5": "Model output bottom/FFNN5_predictions_bottom.parquet",
         "Non_linear_ensemble": "Model output bottom/Non_linear_ensemble_predictions_bottom.parquet"},
     y_true_col="y_true",
     y_pred_col="y_pred",
@@ -9562,6 +11280,11 @@ cw_results = model_level_clarke_west_statistics(
         "Linear_ensemble": "Model output alternative data/Linear_ensemble_predictions_alternative_data.parquet",
         "GBRT": "Model output alternative data/GBRT_predictions_alternative_data.parquet",
         "RF": "Model output alternative data/RF_predictions_alternative_data.parquet",
+        "FFNN1": "Model output alternative data/FFNN1_predictions_alternative_data.parquet",
+        "FFNN2": "Model output alternative data/FFNN2_predictions_alternative_data.parquet",
+        "FFNN3": "Model output alternative data/FFNN3_predictions_alternative_data.parquet",
+        "FFNN4": "Model output alternative data/FFNN4_predictions_alternative_data.parquet",
+        "FFNN5": "Model output alternative data/FFNN5_predictions_alternative_data.parquet",
         "Non_linear_ensemble": "Model output alternative data/Non_linear_ensemble_predictions_alternative_data.parquet"},
     y_true_col="y_true",
     y_pred_col="y_pred",
@@ -9580,6 +11303,11 @@ cw_results = model_level_clarke_west_statistics(
         "Linear_ensemble": "Model output alternative sample split/Linear_ensemble_predictions_alternative_sample_split.parquet",
         "GBRT": "Model output alternative sample split/GBRT_predictions_alternative_sample_split.parquet",
         "RF": "Model output alternative sample split/RF_predictions_alternative_sample_split.parquet",
+        "FFNN1": "Model output alternative sample split/FFNN1_predictions_alternative_sample_split.parquet",
+        "FFNN2": "Model output alternative sample split/FFNN2_predictions_alternative_sample_split.parquet",
+        "FFNN3": "Model output alternative sample split/FFNN3_predictions_alternative_sample_split.parquet",
+        "FFNN4": "Model output alternative sample split/FFNN4_predictions_alternative_sample_split.parquet",
+        "FFNN5": "Model output alternative sample split/FFNN5_predictions_alternative_sample_split.parquet",
         "Non_linear_ensemble": "Model output alternative sample split/Non_linear_ensemble_predictions_alternative_sample_split.parquet"},
     y_true_col="y_true",
     y_pred_col="y_pred",
@@ -9601,6 +11329,11 @@ dm_stats = dm_test(
         "Linear_ensemble": "Model output/Linear_ensemble_predictions.parquet",
         "GBRT": "Model output/GBRT_predictions.parquet",
         "RF": "Model output/RF_predictions.parquet",
+        "FFNN1": "Model output/FFNN1_predictions.parquet",
+        "FFNN2": "Model output/FFNN2_predictions.parquet",
+        "FFNN3": "Model output/FFNN3_predictions.parquet",
+        "FFNN4": "Model output/FFNN4_predictions.parquet",
+        "FFNN5": "Model output/FFNN5_predictions.parquet",
         "Non_linear_ensemble": "Model output/Non_linear_ensemble_predictions.parquet"},
     y_true="y_true",
     date_col="date",
@@ -9620,6 +11353,11 @@ dm_stats = dm_test(
         "Linear_ensemble": "Model output winsorized/Linear_ensemble_predictions_winsorized.parquet",
         "GBRT": "Model output winsorized/GBRT_predictions_winsorized.parquet",
         "RF": "Model output winsorized/RF_predictions_winsorized.parquet",
+        "FFNN1": "Model output winsorized/FFNN1_predictions_winsorized.parquet",
+        "FFNN2": "Model output winsorized/FFNN2_predictions_winsorized.parquet",
+        "FFNN3": "Model output winsorized/FFNN3_predictions_winsorized.parquet",
+        "FFNN4": "Model output winsorized/FFNN4_predictions_winsorized.parquet",
+        "FFNN5": "Model output winsorized/FFNN5_predictions_winsorized.parquet",
         "Non_linear_ensemble": "Model output winsorized/Non_linear_ensemble_predictions_winsorized.parquet"},
     y_true="y_true",
     date_col="date",
@@ -9639,6 +11377,11 @@ dm_stats = dm_test(
         "Linear_ensemble": "Model output alternative data/Linear_ensemble_predictions_alternative_data.parquet",
         "GBRT": "Model output alternative data/GBRT_predictions_alternative_data.parquet",
         "RF": "Model output alternative data/RF_predictions_alternative_data.parquet",
+        "FFNN1": "Model output alternative data/FFNN1_predictions_alternative_data.parquet",
+        "FFNN2": "Model output alternative data/FFNN2_predictions_alternative_data.parquet",
+        "FFNN3": "Model output alternative data/FFNN3_predictions_alternative_data.parquet",
+        "FFNN4": "Model output alternative data/FFNN4_predictions_alternative_data.parquet",
+        "FFNN5": "Model output alternative data/FFNN5_predictions_alternative_data.parquet",
         "Non_linear_ensemble": "Model output alternative data/Non_linear_ensemble_predictions_alternative_data.parquet"},
     y_true="y_true",
     date_col="date",
@@ -9658,6 +11401,11 @@ dm_stats = dm_test(
         "Linear_ensemble": "Model output top/Linear_ensemble_predictions_top.parquet",
         "GBRT": "Model output top/GBRT_predictions_top.parquet",
         "RF": "Model output top/RF_predictions_top.parquet",
+        "FFNN1": "Model output top/FFNN1_predictions_top.parquet",
+        "FFNN2": "Model output top/FFNN2_predictions_top.parquet",
+        "FFNN3": "Model output top/FFNN3_predictions_top.parquet",
+        "FFNN4": "Model output top/FFNN4_predictions_top.parquet",
+        "FFNN5": "Model output top/FFNN5_predictions_top.parquet",
         "Non_linear_ensemble": "Model output top/Non_linear_ensemble_predictions_top.parquet"},
     y_true="y_true",
     date_col="date",
@@ -9677,6 +11425,11 @@ dm_stats = dm_test(
         "Linear_ensemble": "Model output bottom/Linear_ensemble_predictions_bottom.parquet",
         "GBRT": "Model output bottom/GBRT_predictions_bottom.parquet",
         "RF": "Model output bottom/RF_predictions_bottom.parquet",
+        "FFNN1": "Model output bottom/FFNN1_predictions_bottom.parquet",
+        "FFNN2": "Model output bottom/FFNN2_predictions_bottom.parquet",
+        "FFNN3": "Model output bottom/FFNN3_predictions_bottom.parquet",
+        "FFNN4": "Model output bottom/FFNN4_predictions_bottom.parquet",
+        "FFNN5": "Model output bottom/FFNN5_predictions_bottom.parquet",
         "Non_linear_ensemble": "Model output bottom/Non_linear_ensemble_predictions_bottom.parquet"},
     y_true="y_true",
     date_col="date",
@@ -9696,6 +11449,11 @@ dm_stats = dm_test(
         "Linear_ensemble": "Model output alternative data/Linear_ensemble_predictions_alternative_data.parquet",
         "GBRT": "Model output alternative data/GBRT_predictions_alternative_data.parquet",
         "RF": "Model output alternative data/RF_predictions_alternative_data.parquet",
+        "FFNN1": "Model output alternative data/FFNN1_predictions_alternative_data.parquet",
+        "FFNN2": "Model output alternative data/FFNN2_predictions_alternative_data.parquet",
+        "FFNN3": "Model output alternative data/FFNN3_predictions_alternative_data.parquet",
+        "FFNN4": "Model output alternative data/FFNN4_predictions_alternative_data.parquet",
+        "FFNN5": "Model output alternative data/FFNN5_predictions_alternative_data.parquet",
         "Non_linear_ensemble": "Model output alternative data/Non_linear_ensemble_predictions_alternative_data.parquet"},
     y_true="y_true",
     date_col="date",
@@ -9715,6 +11473,11 @@ dm_stats = dm_test(
         "Linear_ensemble": "Model output alternative sample split/Linear_ensemble_predictions_alternative_sample_split.parquet",
         "GBRT": "Model output alternative sample split/GBRT_predictions_alternative_sample_split.parquet",
         "RF": "Model output alternative sample split/RF_predictions_alternative_sample_split.parquet",
+        "FFNN1": "Model output alternative sample split/FFNN1_predictions_alternative_sample_split.parquet",
+        "FFNN2": "Model output alternative sample split/FFNN2_predictions_alternative_sample_split.parquet",
+        "FFNN3": "Model output alternative sample split/FFNN3_predictions_alternative_sample_split.parquet",
+        "FFNN4": "Model output alternative sample split/FFNN4_predictions_alternative_sample_split.parquet",
+        "FFNN5": "Model output alternative sample split/FFNN5_predictions_alternative_sample_split.parquet",
         "Non_linear_ensemble": "Model output alternative sample split/Non_linear_ensemble_predictions_alternative_sample_split.parquet"},
     y_true="y_true",
     date_col="date",
@@ -9727,6 +11490,9 @@ dm_stats = dm_test(
 ## Market portfolio
 """
 
+# ==============================================================================
+# MARKET PORTFOLIO
+# ==============================================================================
 market_excess_returns, market_excess_return_metrics = calculate_market_excess_return_metrics(
     input_filename="Raw data/FF3.csv",
     output_filename="Portfolios/market_excess_returns.parquet",
@@ -9745,6 +11511,9 @@ market_excess_returns, market_excess_return_metrics = calculate_market_excess_re
 Pooled OLS
 """
 
+# ==============================================================================
+# OLS
+# ==============================================================================
 ols_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output/OLS_predictions.parquet",
     output_filename="Portfolios/OLS_decile_portfolios_equal_weight.parquet",
@@ -9763,6 +11532,9 @@ ols_equal_weight_portfolios = create_decile_long_short_portfolios(
 
 """OLS-FF3"""
 
+# ==============================================================================
+# OLS-FF3
+# ==============================================================================
 ols_ff3_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output/OLS_FF3_predictions.parquet",
     output_filename="Portfolios/OLS_FF3_decile_portfolios_equal_weight.parquet",
@@ -9781,6 +11553,9 @@ ols_ff3_equal_weight_portfolios = create_decile_long_short_portfolios(
 
 """PCR"""
 
+# ==============================================================================
+# PCR
+# ==============================================================================
 pcr_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output/PCR_predictions.parquet",
     output_filename="Portfolios/PCR_decile_portfolios_equal_weight.parquet",
@@ -9799,6 +11574,9 @@ pcr_equal_weight_portfolios = create_decile_long_short_portfolios(
 
 """IPCA"""
 
+# ==============================================================================
+# IPCA
+# ==============================================================================
 ipca_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output/IPCA_predictions.parquet",
     output_filename="Portfolios/IPCA_decile_portfolios_equal_weight.parquet",
@@ -9817,6 +11595,9 @@ ipca_equal_weight_portfolios = create_decile_long_short_portfolios(
 
 """PLS"""
 
+# ==============================================================================
+# PLS
+# ==============================================================================
 pls_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output/PLS_predictions.parquet",
     output_filename="Portfolios/PLS_decile_portfolios_equal_weight.parquet",
@@ -9835,6 +11616,9 @@ pls_equal_weight_portfolios = create_decile_long_short_portfolios(
 
 """Linear ensemble"""
 
+# ==============================================================================
+# LINEAR ENSEMBLE
+# ==============================================================================
 linear_ensemble_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output/Linear_ensemble_predictions.parquet",
     output_filename="Portfolios/Linear_ensemble_decile_portfolios_equal_weight.parquet",
@@ -9853,6 +11637,9 @@ linear_ensemble_equal_weight_portfolios = create_decile_long_short_portfolios(
 
 """GBRT"""
 
+# ==============================================================================
+# GBRT
+# ==============================================================================
 gbrt_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output/GBRT_predictions.parquet",
     output_filename="Portfolios/GBRT_decile_portfolios_equal_weight.parquet",
@@ -9871,6 +11658,9 @@ gbrt_equal_weight_portfolios = create_decile_long_short_portfolios(
 
 """RF"""
 
+# ==============================================================================
+# RF
+# ==============================================================================
 rf_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output/RF_predictions.parquet",
     output_filename="Portfolios/RF_decile_portfolios_equal_weight.parquet",
@@ -9887,8 +11677,123 @@ rf_equal_weight_portfolios = create_decile_long_short_portfolios(
     CW_lags=4,
     print_summary=True)
 
+"""FFNN"""
+
+# ==============================================================================
+# FFNN1
+# ==============================================================================
+print("="*110)
+print("FFNN1")
+print("="*110)
+ffnn1_equal_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output/FFNN1_predictions.parquet",
+    output_filename="Portfolios/FFNN1_decile_portfolios_equal_weight.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="equal",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN2
+# ==============================================================================
+print("="*110)
+print("FFNN2")
+print("="*110)
+ffnn2_equal_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output/FFNN2_predictions.parquet",
+    output_filename="Portfolios/FFNN2_decile_portfolios_equal_weight.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="equal",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN3
+# ==============================================================================
+print("="*110)
+print("FFNN3")
+print("="*110)
+ffnn3_equal_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output/FFNN3_predictions.parquet",
+    output_filename="Portfolios/FFNN3_decile_portfolios_equal_weight.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="equal",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN4
+# ==============================================================================
+print("="*110)
+print("FFNN4")
+print("="*110)
+ffnn4_equal_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output/FFNN4_predictions.parquet",
+    output_filename="Portfolios/FFNN4_decile_portfolios_equal_weight.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="equal",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN5
+# ==============================================================================
+print("="*110)
+print("FFNN5")
+print("="*110)
+ffnn5_equal_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output/FFNN5_predictions.parquet",
+    output_filename="Portfolios/FFNN5_decile_portfolios_equal_weight.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="equal",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
 """Non-linear ensemble"""
 
+# ==============================================================================
+# NON-LINEAR ENSEMBLE
+# ==============================================================================
 non_linear_ensemble_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output/Non_linear_ensemble_predictions.parquet",
     output_filename="Portfolios/Non_linear_ensemble_decile_portfolios_equal_weight.parquet",
@@ -9910,6 +11815,9 @@ non_linear_ensemble_equal_weight_portfolios = create_decile_long_short_portfolio
 Pooled OLS
 """
 
+# ==============================================================================
+# OLS
+# ==============================================================================
 ols_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output/OLS_predictions.parquet",
     output_filename="Portfolios/OLS_decile_portfolios_value_weight.parquet",
@@ -9928,6 +11836,9 @@ ols_value_weight_portfolios = create_decile_long_short_portfolios(
 
 """OLS-FF3"""
 
+# ==============================================================================
+# OLS-FF3
+# ==============================================================================
 ols_ff3_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output/OLS_FF3_predictions.parquet",
     output_filename="Portfolios/OLS_FF3_decile_portfolios_value_weight.parquet",
@@ -9946,6 +11857,9 @@ ols_ff3_value_weight_portfolios = create_decile_long_short_portfolios(
 
 """PCR"""
 
+# ==============================================================================
+# PCR
+# ==============================================================================
 pcr_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output/PCR_predictions.parquet",
     output_filename="Portfolios/PCR_decile_portfolios_value_weight.parquet",
@@ -9964,6 +11878,9 @@ pcr_value_weight_portfolios = create_decile_long_short_portfolios(
 
 """IPCA"""
 
+# ==============================================================================
+# IPCA
+# ==============================================================================
 ipca_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output/IPCA_predictions.parquet",
     output_filename="Portfolios/IPCA_decile_portfolios_value_weight.parquet",
@@ -9982,6 +11899,9 @@ ipca_value_weight_portfolios = create_decile_long_short_portfolios(
 
 """PLS"""
 
+# ==============================================================================
+# PLS
+# ==============================================================================
 pls_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output/PLS_predictions.parquet",
     output_filename="Portfolios/PLS_decile_portfolios_value_weight.parquet",
@@ -10000,6 +11920,9 @@ pls_value_weight_portfolios = create_decile_long_short_portfolios(
 
 """Linear ensemble"""
 
+# ==============================================================================
+# LINEAR ENSEMBLE
+# ==============================================================================
 linear_ensemble_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output/Linear_ensemble_predictions.parquet",
     output_filename="Portfolios/Linear_ensemble_decile_portfolios_value_weight.parquet",
@@ -10018,6 +11941,9 @@ linear_ensemble_value_weight_portfolios = create_decile_long_short_portfolios(
 
 """GBRT"""
 
+# ==============================================================================
+# GBRT
+# ==============================================================================
 gbrt_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output/GBRT_predictions.parquet",
     output_filename="Portfolios/GBRT_decile_portfolios_value_weight.parquet",
@@ -10036,6 +11962,9 @@ gbrt_value_weight_portfolios = create_decile_long_short_portfolios(
 
 """RF"""
 
+# ==============================================================================
+# RF
+# ==============================================================================
 rf_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output/RF_predictions.parquet",
     output_filename="Portfolios/RF_decile_portfolios_value_weight.parquet",
@@ -10052,8 +11981,123 @@ rf_value_weight_portfolios = create_decile_long_short_portfolios(
     CW_lags=4,
     print_summary=True)
 
+"""FFNN"""
+
+# ==============================================================================
+# FFNN1
+# ==============================================================================
+print("="*110)
+print("FFNN1")
+print("="*110)
+ffnn1_value_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output/FFNN1_predictions.parquet",
+    output_filename="Portfolios/FFNN1_decile_portfolios_value_weight.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="value",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN2
+# ==============================================================================
+print("="*110)
+print("FFNN2")
+print("="*110)
+ffnn2_value_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output/FFNN2_predictions.parquet",
+    output_filename="Portfolios/FFNN2_decile_portfolios_value_weight.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="value",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN3
+# ==============================================================================
+print("="*110)
+print("FFNN3")
+print("="*110)
+ffnn3_value_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output/FFNN3_predictions.parquet",
+    output_filename="Portfolios/FFNN3_decile_portfolios_value_weight.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="value",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN4
+# ==============================================================================
+print("="*110)
+print("FFNN4")
+print("="*110)
+ffnn4_value_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output/FFNN4_predictions.parquet",
+    output_filename="Portfolios/FFNN4_decile_portfolios_value_weight.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="value",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN5
+# ==============================================================================
+print("="*110)
+print("FFNN5")
+print("="*110)
+ffnn5_value_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output/FFNN5_predictions.parquet",
+    output_filename="Portfolios/FFNN5_decile_portfolios_value_weight.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="value",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
 """Non-linear ensemble"""
 
+# ==============================================================================
+# NON-LINEAR ENSEMBLE
+# ==============================================================================
 non_linear_ensemble_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output/Non_linear_ensemble_predictions.parquet",
     output_filename="Portfolios/Non_linear_ensemble_decile_portfolios_value_weight.parquet",
@@ -10077,6 +12121,9 @@ non_linear_ensemble_value_weight_portfolios = create_decile_long_short_portfolio
 Pooled OLS
 """
 
+# ==============================================================================
+# OLS
+# ==============================================================================
 ols_winsorized_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output winsorized/OLS_predictions_winsorized.parquet",
     output_filename="Portfolios/OLS_decile_portfolios_equal_weight_winsorized.parquet",
@@ -10095,6 +12142,9 @@ ols_winsorized_equal_weight_portfolios = create_decile_long_short_portfolios(
 
 """OLS-FF3"""
 
+# ==============================================================================
+# OLS-FF3
+# ==============================================================================
 ols_ff3_winsorized_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output winsorized/OLS_FF3_predictions_winsorized.parquet",
     output_filename="Portfolios/OLS_FF3_decile_portfolios_equal_weight_winsorized.parquet",
@@ -10113,6 +12163,9 @@ ols_ff3_winsorized_equal_weight_portfolios = create_decile_long_short_portfolios
 
 """PCR"""
 
+# ==============================================================================
+# PCR
+# ==============================================================================
 pcr_winsorized_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output winsorized/PCR_predictions_winsorized.parquet",
     output_filename="Portfolios/PCR_decile_portfolios_equal_weight_winsorized.parquet",
@@ -10131,6 +12184,9 @@ pcr_winsorized_equal_weight_portfolios = create_decile_long_short_portfolios(
 
 """IPCA"""
 
+# ==============================================================================
+# IPCA
+# ==============================================================================
 ipca_winsorized_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output winsorized/IPCA_predictions_winsorized.parquet",
     output_filename="Portfolios/IPCA_decile_portfolios_equal_weight_winsorized.parquet",
@@ -10149,6 +12205,9 @@ ipca_winsorized_equal_weight_portfolios = create_decile_long_short_portfolios(
 
 """PLS"""
 
+# ==============================================================================
+# PLS
+# ==============================================================================
 pls_winsorized_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output winsorized/PLS_predictions_winsorized.parquet",
     output_filename="Portfolios/PLS_decile_portfolios_equal_weight_winsorized.parquet",
@@ -10167,6 +12226,9 @@ pls_winsorized_equal_weight_portfolios = create_decile_long_short_portfolios(
 
 """Linear ensemble"""
 
+# ==============================================================================
+# LINEAR ENSEMBLE
+# ==============================================================================
 linear_ensemble_winsorized_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output winsorized/Linear_ensemble_predictions_winsorized.parquet",
     output_filename="Portfolios/Linear_ensemble_decile_portfolios_equal_weight_winsorized.parquet",
@@ -10185,6 +12247,9 @@ linear_ensemble_winsorized_equal_weight_portfolios = create_decile_long_short_po
 
 """GBRT"""
 
+# ==============================================================================
+# GBRT
+# ==============================================================================
 gbrt_winsorized_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output winsorized/GBRT_predictions_winsorized.parquet",
     output_filename="Portfolios/GBRT_decile_portfolios_equal_weight_winsorized.parquet",
@@ -10203,6 +12268,9 @@ gbrt_winsorized_equal_weight_portfolios = create_decile_long_short_portfolios(
 
 """RF"""
 
+# ==============================================================================
+# RF
+# ==============================================================================
 rf_winsorized_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output winsorized/RF_predictions_winsorized.parquet",
     output_filename="Portfolios/RF_decile_portfolios_equal_weight_winsorized.parquet",
@@ -10219,8 +12287,123 @@ rf_winsorized_equal_weight_portfolios = create_decile_long_short_portfolios(
     CW_lags=4,
     print_summary=True)
 
+"""FFNN"""
+
+# ==============================================================================
+# FFNN1
+# ==============================================================================
+print("="*110)
+print("FFNN1")
+print("="*110)
+ffnn1_winsorized_equal_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output winsorized/FFNN1_predictions_winsorized.parquet",
+    output_filename="Portfolios/FFNN1_decile_portfolios_equal_weight_winsorized.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="equal",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN2
+# ==============================================================================
+print("="*110)
+print("FFNN2")
+print("="*110)
+ffnn2_winsorized_equal_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output winsorized/FFNN2_predictions_winsorized.parquet",
+    output_filename="Portfolios/FFNN2_decile_portfolios_equal_weight_winsorized.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="equal",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN3
+# ==============================================================================
+print("="*110)
+print("FFNN3")
+print("="*110)
+ffnn3_winsorized_equal_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output winsorized/FFNN3_predictions_winsorized.parquet",
+    output_filename="Portfolios/FFNN3_decile_portfolios_equal_weight_winsorized.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="equal",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN4
+# ==============================================================================
+print("="*110)
+print("FFNN4")
+print("="*110)
+ffnn4_winsorized_equal_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output winsorized/FFNN4_predictions_winsorized.parquet",
+    output_filename="Portfolios/FFNN4_decile_portfolios_equal_weight_winsorized.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="equal",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN5
+# ==============================================================================
+print("="*110)
+print("FFNN5")
+print("="*110)
+ffnn5_winsorized_equal_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output winsorized/FFNN5_predictions_winsorized.parquet",
+    output_filename="Portfolios/FFNN5_decile_portfolios_equal_weight_winsorized.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="equal",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
 """Non-linear ensemble"""
 
+# ==============================================================================
+# NON-LINEAR ENSEMBLE
+# ==============================================================================
 non_linear_ensemble_winsorized_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output winsorized/Non_linear_ensemble_predictions_winsorized.parquet",
     output_filename="Portfolios/Non_linear_ensemble_decile_portfolios_equal_weight_winsorized.parquet",
@@ -10242,6 +12425,9 @@ non_linear_ensemble_winsorized_equal_weight_portfolios = create_decile_long_shor
 Pooled OLS
 """
 
+# ==============================================================================
+# OLS
+# ==============================================================================
 ols_winsorized_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output winsorized/OLS_predictions_winsorized.parquet",
     output_filename="Portfolios/OLS_decile_portfolios_value_weight_winsorized.parquet",
@@ -10260,6 +12446,9 @@ ols_winsorized_value_weight_portfolios = create_decile_long_short_portfolios(
 
 """OLS-FF3"""
 
+# ==============================================================================
+# OLS-FF3
+# ==============================================================================
 ols_ff3_winsorized_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output winsorized/OLS_FF3_predictions_winsorized.parquet",
     output_filename="Portfolios/OLS_FF3_decile_portfolios_value_weight_winsorized.parquet",
@@ -10278,6 +12467,9 @@ ols_ff3_winsorized_value_weight_portfolios = create_decile_long_short_portfolios
 
 """PCR"""
 
+# ==============================================================================
+# PCR
+# ==============================================================================
 pcr_winsorized_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output winsorized/PCR_predictions_winsorized.parquet",
     output_filename="Portfolios/PCR_decile_portfolios_value_weight_winsorized.parquet",
@@ -10296,6 +12488,9 @@ pcr_winsorized_value_weight_portfolios = create_decile_long_short_portfolios(
 
 """IPCA"""
 
+# ==============================================================================
+# IPCA
+# ==============================================================================
 ipca_winsorized_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output winsorized/IPCA_predictions_winsorized.parquet",
     output_filename="Portfolios/IPCA_decile_portfolios_value_weight_winsorized.parquet",
@@ -10314,6 +12509,9 @@ ipca_winsorized_value_weight_portfolios = create_decile_long_short_portfolios(
 
 """PLS"""
 
+# ==============================================================================
+# PLS
+# ==============================================================================
 pls_winsorized_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output winsorized/PLS_predictions_winsorized.parquet",
     output_filename="Portfolios/PLS_decile_portfolios_value_weight_winsorized.parquet",
@@ -10332,6 +12530,9 @@ pls_winsorized_value_weight_portfolios = create_decile_long_short_portfolios(
 
 """Linear ensemble"""
 
+# ==============================================================================
+# LINEAR ENSEMBLE
+# ==============================================================================
 linear_ensemble_winsorized_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output winsorized/Linear_ensemble_predictions_winsorized.parquet",
     output_filename="Portfolios/Linear_ensemble_decile_portfolios_value_weight_winsorized.parquet",
@@ -10350,6 +12551,9 @@ linear_ensemble_winsorized_value_weight_portfolios = create_decile_long_short_po
 
 """GBRT"""
 
+# ==============================================================================
+# GBRT
+# ==============================================================================
 gbrt_winsorized_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output winsorized/GBRT_predictions_winsorized.parquet",
     output_filename="Portfolios/GBRT_decile_portfolios_value_weight_winsorized.parquet",
@@ -10368,6 +12572,9 @@ gbrt_winsorized_value_weight_portfolios = create_decile_long_short_portfolios(
 
 """RF"""
 
+# ==============================================================================
+# RF
+# ==============================================================================
 rf_winsorized_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output winsorized/RF_predictions_winsorized.parquet",
     output_filename="Portfolios/RF_decile_portfolios_value_weight_winsorized.parquet",
@@ -10384,8 +12591,123 @@ rf_winsorized_value_weight_portfolios = create_decile_long_short_portfolios(
     CW_lags=4,
     print_summary=True)
 
+"""FFNN"""
+
+# ==============================================================================
+# FFNN1
+# ==============================================================================
+print("="*110)
+print("FFNN1")
+print("="*110)
+ffnn1_winsorized_value_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output winsorized/FFNN1_predictions_winsorized.parquet",
+    output_filename="Portfolios/FFNN1_decile_portfolios_value_weight_winsorized.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="value",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN2
+# ==============================================================================
+print("="*110)
+print("FFNN2")
+print("="*110)
+ffnn2_winsorized_value_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output winsorized/FFNN2_predictions_winsorized.parquet",
+    output_filename="Portfolios/FFNN2_decile_portfolios_value_weight_winsorized.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="value",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN3
+# ==============================================================================
+print("="*110)
+print("FFNN3")
+print("="*110)
+ffnn3_winsorized_value_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output winsorized/FFNN3_predictions_winsorized.parquet",
+    output_filename="Portfolios/FFNN3_decile_portfolios_value_weight_winsorized.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="value",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN4
+# ==============================================================================
+print("="*110)
+print("FFNN4")
+print("="*110)
+ffnn4_winsorized_value_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output winsorized/FFNN4_predictions_winsorized.parquet",
+    output_filename="Portfolios/FFNN4_decile_portfolios_value_weight_winsorized.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="value",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN5
+# ==============================================================================
+print("="*110)
+print("FFNN5")
+print("="*110)
+ffnn5_winsorized_value_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output winsorized/FFNN5_predictions_winsorized.parquet",
+    output_filename="Portfolios/FFNN5_decile_portfolios_value_weight_winsorized.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="value",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
 """Non-linear ensemble"""
 
+# ==============================================================================
+# NON-LINEAR ENSEMBLE
+# ==============================================================================
 non_linear_ensemble_winsorized_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output winsorized/Non_linear_ensemble_predictions_winsorized.parquet",
     output_filename="Portfolios/Non_linear_ensemble_decile_portfolios_value_weight_winsorized.parquet",
@@ -10409,6 +12731,9 @@ non_linear_ensemble_winsorized_value_weight_portfolios = create_decile_long_shor
 Pooled OLS
 """
 
+# ==============================================================================
+# OLS
+# ==============================================================================
 ols_alternative_data_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative data/OLS_predictions_alternative_data.parquet",
     output_filename="Portfolios/OLS_decile_portfolios_equal_weight_alternative_data.parquet",
@@ -10427,6 +12752,9 @@ ols_alternative_data_equal_weight_portfolios = create_decile_long_short_portfoli
 
 """OLS-FF3"""
 
+# ==============================================================================
+# OLS-FF3
+# ==============================================================================
 ols_ff3_alternative_data_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative data/OLS_FF3_predictions_alternative_data.parquet",
     output_filename="Portfolios/OLS_FF3_decile_portfolios_equal_weight_alternative_data.parquet",
@@ -10445,6 +12773,9 @@ ols_ff3_alternative_data_equal_weight_portfolios = create_decile_long_short_port
 
 """PCR"""
 
+# ==============================================================================
+# PCR
+# ==============================================================================
 pcr_alternative_data_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative data/PCR_predictions_alternative_data.parquet",
     output_filename="Portfolios/PCR_decile_portfolios_equal_weight_alternative_data.parquet",
@@ -10463,6 +12794,9 @@ pcr_alternative_data_equal_weight_portfolios = create_decile_long_short_portfoli
 
 """IPCA"""
 
+# ==============================================================================
+# IPCA
+# ==============================================================================
 ipca_alternative_data_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative data/IPCA_predictions_alternative_data.parquet",
     output_filename="Portfolios/IPCA_decile_portfolios_equal_weight_alternative_data.parquet",
@@ -10481,6 +12815,9 @@ ipca_alternative_data_equal_weight_portfolios = create_decile_long_short_portfol
 
 """PLS"""
 
+# ==============================================================================
+# PLS
+# ==============================================================================
 pls_alternative_data_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative data/PLS_predictions_alternative_data.parquet",
     output_filename="Portfolios/PLS_decile_portfolios_equal_weight_alternative_data.parquet",
@@ -10499,6 +12836,9 @@ pls_alternative_data_equal_weight_portfolios = create_decile_long_short_portfoli
 
 """Linear ensemble"""
 
+# ==============================================================================
+# LINEAR ENSEMBLE
+# ==============================================================================
 linear_ensemble_alternative_data_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative data/Linear_ensemble_predictions_alternative_data.parquet",
     output_filename="Portfolios/Linear_ensemble_decile_portfolios_equal_weight_alternative_data.parquet",
@@ -10517,6 +12857,9 @@ linear_ensemble_alternative_data_equal_weight_portfolios = create_decile_long_sh
 
 """GBRT"""
 
+# ==============================================================================
+# GBRT
+# ==============================================================================
 gbrt_alternative_data_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative data/GBRT_predictions_alternative_data.parquet",
     output_filename="Portfolios/GBRT_decile_portfolios_equal_weight_alternative_data.parquet",
@@ -10535,6 +12878,9 @@ gbrt_alternative_data_equal_weight_portfolios = create_decile_long_short_portfol
 
 """RF"""
 
+# ==============================================================================
+# RF
+# ==============================================================================
 rf_alternative_data_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative data/RF_predictions_alternative_data.parquet",
     output_filename="Portfolios/RF_decile_portfolios_equal_weight_alternative_data.parquet",
@@ -10551,8 +12897,123 @@ rf_alternative_data_equal_weight_portfolios = create_decile_long_short_portfolio
     CW_lags=4,
     print_summary=True)
 
+"""FFNN"""
+
+# ==============================================================================
+# FFNN1
+# ==============================================================================
+print("="*110)
+print("FFNN1")
+print("="*110)
+ffnn1_alternative_data_equal_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output alternative data/FFNN1_predictions_alternative_data.parquet",
+    output_filename="Portfolios/FFNN1_decile_portfolios_equal_weight_alternative_data.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="equal",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN2
+# ==============================================================================
+print("="*110)
+print("FFNN2")
+print("="*110)
+ffnn2_alternative_data_equal_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output alternative data/FFNN2_predictions_alternative_data.parquet",
+    output_filename="Portfolios/FFNN2_decile_portfolios_equal_weight_alternative_data.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="equal",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN3
+# ==============================================================================
+print("="*110)
+print("FFNN3")
+print("="*110)
+ffnn3_alternative_data_equal_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output alternative data/FFNN3_predictions_alternative_data.parquet",
+    output_filename="Portfolios/FFNN3_decile_portfolios_equal_weight_alternative_data.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="equal",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN4
+# ==============================================================================
+print("="*110)
+print("FFNN4")
+print("="*110)
+ffnn4_alternative_data_equal_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output alternative data/FFNN4_predictions_alternative_data.parquet",
+    output_filename="Portfolios/FFNN4_decile_portfolios_equal_weight_alternative_data.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="equal",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN5
+# ==============================================================================
+print("="*110)
+print("FFNN5")
+print("="*110)
+ffnn5_alternative_data_equal_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output alternative data/FFNN5_predictions_alternative_data.parquet",
+    output_filename="Portfolios/FFNN5_decile_portfolios_equal_weight_alternative_data.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="equal",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
 """Non-linear ensemble"""
 
+# ==============================================================================
+# NON-LINEAR ENSEMBLE
+# ==============================================================================
 non_linear_ensemble_alternative_data_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative data/Non_linear_ensemble_predictions_alternative_data.parquet",
     output_filename="Portfolios/Non_linear_ensemble_decile_portfolios_equal_weight_alternative_data.parquet",
@@ -10574,6 +13035,9 @@ non_linear_ensemble_alternative_data_equal_weight_portfolios = create_decile_lon
 Pooled OLS
 """
 
+# ==============================================================================
+# OLS
+# ==============================================================================
 ols_alternative_data_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative data/OLS_predictions_alternative_data.parquet",
     output_filename="Portfolios/OLS_decile_portfolios_value_weight_alternative_data.parquet",
@@ -10592,6 +13056,9 @@ ols_alternative_data_value_weight_portfolios = create_decile_long_short_portfoli
 
 """OLS-FF3"""
 
+# ==============================================================================
+# OLS-FF3
+# ==============================================================================
 ols_ff3_alternative_data_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative data/OLS_FF3_predictions_alternative_data.parquet",
     output_filename="Portfolios/OLS_FF3_decile_portfolios_value_weight_alternative_data.parquet",
@@ -10610,6 +13077,9 @@ ols_ff3_alternative_data_value_weight_portfolios = create_decile_long_short_port
 
 """PCR"""
 
+# ==============================================================================
+# PCR
+# ==============================================================================
 pcr_alternative_data_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative data/PCR_predictions_alternative_data.parquet",
     output_filename="Portfolios/PCR_decile_portfolios_value_weight_alternative_data.parquet",
@@ -10628,6 +13098,9 @@ pcr_alternative_data_value_weight_portfolios = create_decile_long_short_portfoli
 
 """IPCA"""
 
+# ==============================================================================
+# IPCA
+# ==============================================================================
 ipca_alternative_data_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative data/IPCA_predictions_alternative_data.parquet",
     output_filename="Portfolios/IPCA_decile_portfolios_value_weight_alternative_data.parquet",
@@ -10646,6 +13119,9 @@ ipca_alternative_data_value_weight_portfolios = create_decile_long_short_portfol
 
 """PLS"""
 
+# ==============================================================================
+# PLS
+# ==============================================================================
 pls_alternative_data_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative data/PLS_predictions_alternative_data.parquet",
     output_filename="Portfolios/PLS_decile_portfolios_value_weight_alternative_data.parquet",
@@ -10664,6 +13140,9 @@ pls_alternative_data_value_weight_portfolios = create_decile_long_short_portfoli
 
 """Linear ensemble"""
 
+# ==============================================================================
+# LINEAR ENSEMBLE
+# ==============================================================================
 linear_ensemble_alternative_data_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative data/Linear_ensemble_predictions_alternative_data.parquet",
     output_filename="Portfolios/Linear_ensemble_decile_portfolios_value_weight_alternative_data.parquet",
@@ -10682,6 +13161,9 @@ linear_ensemble_alternative_data_value_weight_portfolios = create_decile_long_sh
 
 """GBRT"""
 
+# ==============================================================================
+# GBRT
+# ==============================================================================
 gbrt_alternative_data_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative data/GBRT_predictions_alternative_data.parquet",
     output_filename="Portfolios/GBRT_decile_portfolios_value_weight_alternative_data.parquet",
@@ -10700,6 +13182,9 @@ gbrt_alternative_data_value_weight_portfolios = create_decile_long_short_portfol
 
 """RF"""
 
+# ==============================================================================
+# RF
+# ==============================================================================
 rf_alternative_data_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative data/RF_predictions_alternative_data.parquet",
     output_filename="Portfolios/RF_decile_portfolios_value_weight_alternative_data.parquet",
@@ -10716,8 +13201,123 @@ rf_alternative_data_value_weight_portfolios = create_decile_long_short_portfolio
     CW_lags=4,
     print_summary=True)
 
+"""FFNN"""
+
+# ==============================================================================
+# FFNN1
+# ==============================================================================
+print("="*110)
+print("FFNN2")
+print("="*110)
+ffnn1_alternative_data_value_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output alternative data/FFNN1_predictions_alternative_data.parquet",
+    output_filename="Portfolios/FFNN1_decile_portfolios_value_weight_alternative_data.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="value",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN2
+# ==============================================================================
+print("="*110)
+print("FFNN2")
+print("="*110)
+ffnn2_alternative_data_value_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output alternative data/FFNN2_predictions_alternative_data.parquet",
+    output_filename="Portfolios/FFNN2_decile_portfolios_value_weight_alternative_data.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="value",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN3
+# ==============================================================================
+print("="*110)
+print("FFNN3")
+print("="*110)
+ffnn3_alternative_data_value_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output alternative data/FFNN3_predictions_alternative_data.parquet",
+    output_filename="Portfolios/FFNN3_decile_portfolios_value_weight_alternative_data.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="value",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN4
+# ==============================================================================
+print("="*110)
+print("FFNN4")
+print("="*110)
+ffnn4_alternative_data_value_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output alternative data/FFNN4_predictions_alternative_data.parquet",
+    output_filename="Portfolios/FFNN4_decile_portfolios_value_weight_alternative_data.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="value",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN5
+# ==============================================================================
+print("="*110)
+print("FFNN5")
+print("="*110)
+ffnn5_alternative_data_value_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output alternative data/FFNN5_predictions_alternative_data.parquet",
+    output_filename="Portfolios/FFNN5_decile_portfolios_value_weight_alternative_data.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="value",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
 """Non-linear ensemble"""
 
+# ==============================================================================
+# NON-LINEAR ENSEMBLE
+# ==============================================================================
 non_linear_ensemble_alternative_data_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative data/Non_linear_ensemble_predictions_alternative_data.parquet",
     output_filename="Portfolios/Non_linear_ensemble_decile_portfolios_value_weight_alternative_data.parquet",
@@ -10741,6 +13341,9 @@ non_linear_ensemble_alternative_data_value_weight_portfolios = create_decile_lon
 Pooled OLS
 """
 
+# ==============================================================================
+# OLS
+# ==============================================================================
 ols_top_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output top/OLS_predictions_top.parquet",
     output_filename="Portfolios/OLS_decile_portfolios_equal_weight_top.parquet",
@@ -10759,6 +13362,9 @@ ols_top_equal_weight_portfolios = create_decile_long_short_portfolios(
 
 """OLS-FF3"""
 
+# ==============================================================================
+# OLS-FF3
+# ==============================================================================
 ols_ff3_top_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output top/OLS_FF3_predictions_top.parquet",
     output_filename="Portfolios/OLS_FF3_decile_portfolios_equal_weight_top.parquet",
@@ -10777,6 +13383,9 @@ ols_ff3_top_equal_weight_portfolios = create_decile_long_short_portfolios(
 
 """PCR"""
 
+# ==============================================================================
+# PCR
+# ==============================================================================
 pcr_top_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output top/PCR_predictions_top.parquet",
     output_filename="Portfolios/PCR_decile_portfolios_equal_weight_top.parquet",
@@ -10795,6 +13404,9 @@ pcr_top_equal_weight_portfolios = create_decile_long_short_portfolios(
 
 """IPCA"""
 
+# ==============================================================================
+# IPCA
+# ==============================================================================
 ipca_top_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output top/IPCA_predictions_top.parquet",
     output_filename="Portfolios/IPCA_decile_portfolios_equal_weight_top.parquet",
@@ -10813,6 +13425,9 @@ ipca_top_equal_weight_portfolios = create_decile_long_short_portfolios(
 
 """PLS"""
 
+# ==============================================================================
+# PLS
+# ==============================================================================
 pls_top_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output top/PLS_predictions_top.parquet",
     output_filename="Portfolios/PLS_decile_portfolios_equal_weight_top.parquet",
@@ -10831,6 +13446,9 @@ pls_top_equal_weight_portfolios = create_decile_long_short_portfolios(
 
 """Linear ensemble"""
 
+# ==============================================================================
+# LINEAR ENSEMBLE
+# ==============================================================================
 linear_ensemble_top_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output top/Linear_ensemble_predictions_top.parquet",
     output_filename="Portfolios/Linear_ensemble_decile_portfolios_equal_weight_top.parquet",
@@ -10849,6 +13467,9 @@ linear_ensemble_top_equal_weight_portfolios = create_decile_long_short_portfolio
 
 """GBRT"""
 
+# ==============================================================================
+# GBRT
+# ==============================================================================
 gbrt_top_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output top/GBRT_predictions_top.parquet",
     output_filename="Portfolios/GBRT_decile_portfolios_equal_weight_top.parquet",
@@ -10867,6 +13488,9 @@ gbrt_top_equal_weight_portfolios = create_decile_long_short_portfolios(
 
 """RF"""
 
+# ==============================================================================
+# RF
+# ==============================================================================
 rf_top_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output top/RF_predictions_top.parquet",
     output_filename="Portfolios/RF_decile_portfolios_equal_weight_top.parquet",
@@ -10883,8 +13507,123 @@ rf_top_equal_weight_portfolios = create_decile_long_short_portfolios(
     CW_lags=4,
     print_summary=True)
 
+"""FFNN"""
+
+# ==============================================================================
+# FFNN1
+# ==============================================================================
+print("="*110)
+print("FFNN1")
+print("="*110)
+ffnn1_top_equal_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output top/FFNN1_predictions_top.parquet",
+    output_filename="Portfolios/FFNN1_decile_portfolios_equal_weight_top.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="equal",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN2
+# ==============================================================================
+print("="*110)
+print("FFNN2")
+print("="*110)
+ffnn2_top_equal_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output top/FFNN2_predictions_top.parquet",
+    output_filename="Portfolios/FFNN2_decile_portfolios_equal_weight_top.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="equal",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN3
+# ==============================================================================
+print("="*110)
+print("FFNN3")
+print("="*110)
+ffnn3_top_equal_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output top/FFNN3_predictions_top.parquet",
+    output_filename="Portfolios/FFNN3_decile_portfolios_equal_weight_top.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="equal",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN4
+# ==============================================================================
+print("="*110)
+print("FFNN4")
+print("="*110)
+ffnn4_top_equal_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output top/FFNN4_predictions_top.parquet",
+    output_filename="Portfolios/FFNN4_decile_portfolios_equal_weight_top.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="equal",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN5
+# ==============================================================================
+print("="*110)
+print("FFNN5")
+print("="*110)
+ffnn5_top_equal_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output top/FFNN5_predictions_top.parquet",
+    output_filename="Portfolios/FFNN5_decile_portfolios_equal_weight_top.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="equal",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
 """Non-linear ensemble"""
 
+# ==============================================================================
+# NON-LINEAR ENSEMBLE
+# ==============================================================================
 non_linear_ensemble_top_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output top/Non_linear_ensemble_predictions_top.parquet",
     output_filename="Portfolios/Non_linear_ensemble_decile_portfolios_equal_weight_top.parquet",
@@ -10906,6 +13645,9 @@ non_linear_ensemble_top_equal_weight_portfolios = create_decile_long_short_portf
 Pooled OLS
 """
 
+# ==============================================================================
+# OLS
+# ==============================================================================
 ols_top_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output top/OLS_predictions_top.parquet",
     output_filename="Portfolios/OLS_decile_portfolios_value_weight_top.parquet",
@@ -10924,6 +13666,9 @@ ols_top_value_weight_portfolios = create_decile_long_short_portfolios(
 
 """OLS-FF3"""
 
+# ==============================================================================
+# OLS-FF3
+# ==============================================================================
 ols_ff3_top_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output top/OLS_FF3_predictions_top.parquet",
     output_filename="Portfolios/OLS_FF3_decile_portfolios_value_weight_top.parquet",
@@ -10942,6 +13687,9 @@ ols_ff3_top_value_weight_portfolios = create_decile_long_short_portfolios(
 
 """PCR"""
 
+# ==============================================================================
+# PCR
+# ==============================================================================
 pcr_top_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output top/PCR_predictions_top.parquet",
     output_filename="Portfolios/PCR_decile_portfolios_value_weight_top.parquet",
@@ -10960,6 +13708,9 @@ pcr_top_value_weight_portfolios = create_decile_long_short_portfolios(
 
 """IPCA"""
 
+# ==============================================================================
+# IPCA
+# ==============================================================================
 ipca_top_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output top/IPCA_predictions_top.parquet",
     output_filename="Portfolios/IPCA_decile_portfolios_value_weight_top.parquet",
@@ -10978,6 +13729,9 @@ ipca_top_value_weight_portfolios = create_decile_long_short_portfolios(
 
 """PLS"""
 
+# ==============================================================================
+# PLS
+# ==============================================================================
 pls_top_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output top/PLS_predictions_top.parquet",
     output_filename="Portfolios/PLS_decile_portfolios_value_weight_top.parquet",
@@ -10996,6 +13750,9 @@ pls_top_value_weight_portfolios = create_decile_long_short_portfolios(
 
 """Linear ensemble"""
 
+# ==============================================================================
+# LINEAR ENSEMBLE
+# ==============================================================================
 linear_ensemble_top_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output top/Linear_ensemble_predictions_top.parquet",
     output_filename="Portfolios/Linear_ensemble_decile_portfolios_value_weight_top.parquet",
@@ -11014,6 +13771,9 @@ linear_ensemble_top_value_weight_portfolios = create_decile_long_short_portfolio
 
 """GBRT"""
 
+# ==============================================================================
+# GBRT
+# ==============================================================================
 gbrt_top_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output top/GBRT_predictions_top.parquet",
     output_filename="Portfolios/GBRT_decile_portfolios_value_weight_top.parquet",
@@ -11032,6 +13792,9 @@ gbrt_top_value_weight_portfolios = create_decile_long_short_portfolios(
 
 """RF"""
 
+# ==============================================================================
+# RF
+# ==============================================================================
 rf_top_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output top/RF_predictions_top.parquet",
     output_filename="Portfolios/RF_decile_portfolios_value_weight_top.parquet",
@@ -11048,8 +13811,123 @@ rf_top_value_weight_portfolios = create_decile_long_short_portfolios(
     CW_lags=4,
     print_summary=True)
 
+"""FFNN"""
+
+# ==============================================================================
+# FFNN1
+# ==============================================================================
+print("="*110)
+print("FFNN1")
+print("="*110)
+ffnn1_top_value_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output top/FFNN1_predictions_top.parquet",
+    output_filename="Portfolios/FFNN1_decile_portfolios_value_weight_top.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="value",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN2
+# ==============================================================================
+print("="*110)
+print("FFNN2")
+print("="*110)
+ffnn2_top_value_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output top/FFNN2_predictions_top.parquet",
+    output_filename="Portfolios/FFNN2_decile_portfolios_value_weight_top.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="value",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN3
+# ==============================================================================
+print("="*110)
+print("FFNN3")
+print("="*110)
+ffnn3_top_value_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output top/FFNN3_predictions_top.parquet",
+    output_filename="Portfolios/FFNN3_decile_portfolios_value_weight_top.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="value",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN4
+# ==============================================================================
+print("="*110)
+print("FFNN4")
+print("="*110)
+ffnn4_top_value_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output top/FFNN4_predictions_top.parquet",
+    output_filename="Portfolios/FFNN4_decile_portfolios_value_weight_top.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="value",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN5
+# ==============================================================================
+print("="*110)
+print("FFNN5")
+print("="*110)
+ffnn5_top_value_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output top/FFNN5_predictions_top.parquet",
+    output_filename="Portfolios/FFNN5_decile_portfolios_value_weight_top.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="value",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
 """Non-linear ensemble"""
 
+# ==============================================================================
+# NON-LINEAR ENSEMBLE
+# ==============================================================================
 non_linear_ensemble_top_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output top/Non_linear_ensemble_predictions_top.parquet",
     output_filename="Portfolios/Non_linear_ensemble_decile_portfolios_value_weight_top.parquet",
@@ -11073,6 +13951,9 @@ non_linear_ensemble_top_value_weight_portfolios = create_decile_long_short_portf
 Pooled OLS
 """
 
+# ==============================================================================
+# OLS
+# ==============================================================================
 ols_bottom_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output bottom/OLS_predictions_bottom.parquet",
     output_filename="Portfolios/OLS_decile_portfolios_equal_weight_bottom.parquet",
@@ -11091,6 +13972,9 @@ ols_bottom_equal_weight_portfolios = create_decile_long_short_portfolios(
 
 """OLS-FF3"""
 
+# ==============================================================================
+# OLS-FF3
+# ==============================================================================
 ols_ff3_bottom_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output bottom/OLS_FF3_predictions_bottom.parquet",
     output_filename="Portfolios/OLS_FF3_decile_portfolios_equal_weight_bottom.parquet",
@@ -11109,6 +13993,9 @@ ols_ff3_bottom_equal_weight_portfolios = create_decile_long_short_portfolios(
 
 """PCR"""
 
+# ==============================================================================
+# PCR
+# ==============================================================================
 pcr_bottom_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output bottom/PCR_predictions_bottom.parquet",
     output_filename="Portfolios/PCR_decile_portfolios_equal_weight_bottom.parquet",
@@ -11127,6 +14014,9 @@ pcr_bottom_equal_weight_portfolios = create_decile_long_short_portfolios(
 
 """IPCA"""
 
+# ==============================================================================
+# IPCA
+# ==============================================================================
 ipca_bottom_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output bottom/IPCA_predictions_bottom.parquet",
     output_filename="Portfolios/IPCA_decile_portfolios_equal_weight_bottom.parquet",
@@ -11145,6 +14035,9 @@ ipca_bottom_equal_weight_portfolios = create_decile_long_short_portfolios(
 
 """PLS"""
 
+# ==============================================================================
+# PLS
+# ==============================================================================
 pls_bottom_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output bottom/PLS_predictions_bottom.parquet",
     output_filename="Portfolios/PLS_decile_portfolios_equal_weight_bottom.parquet",
@@ -11163,6 +14056,9 @@ pls_bottom_equal_weight_portfolios = create_decile_long_short_portfolios(
 
 """Linear ensemble"""
 
+# ==============================================================================
+# LINEAR ENSEMBLE
+# ==============================================================================
 linear_ensemble_bottom_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output bottom/Linear_ensemble_predictions_bottom.parquet",
     output_filename="Portfolios/Linear_ensemble_decile_portfolios_equal_weight_bottom.parquet",
@@ -11181,6 +14077,9 @@ linear_ensemble_bottom_equal_weight_portfolios = create_decile_long_short_portfo
 
 """GBRT"""
 
+# ==============================================================================
+# GBRT
+# ==============================================================================
 gbrt_bottom_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output bottom/GBRT_predictions_bottom.parquet",
     output_filename="Portfolios/GBRT_decile_portfolios_equal_weight_bottom.parquet",
@@ -11199,6 +14098,9 @@ gbrt_bottom_equal_weight_portfolios = create_decile_long_short_portfolios(
 
 """RF"""
 
+# ==============================================================================
+# RF
+# ==============================================================================
 rf_bottom_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output bottom/RF_predictions_bottom.parquet",
     output_filename="Portfolios/RF_decile_portfolios_equal_weight_bottom.parquet",
@@ -11215,8 +14117,123 @@ rf_bottom_equal_weight_portfolios = create_decile_long_short_portfolios(
     CW_lags=4,
     print_summary=True)
 
+"""FFNN"""
+
+# ==============================================================================
+# FFNN1
+# ==============================================================================
+print("="*110)
+print("FFNN1")
+print("="*110)
+ffnn1_bottom_equal_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output bottom/FFNN1_predictions_bottom.parquet",
+    output_filename="Portfolios/FFNN1_decile_portfolios_equal_weight_bottom.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="equal",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN2
+# ==============================================================================
+print("="*110)
+print("FFNN2")
+print("="*110)
+ffnn2_bottom_equal_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output bottom/FFNN2_predictions_bottom.parquet",
+    output_filename="Portfolios/FFNN2_decile_portfolios_equal_weight_bottom.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="equal",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN3
+# ==============================================================================
+print("="*110)
+print("FFNN3")
+print("="*110)
+ffnn3_bottom_equal_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output bottom/FFNN3_predictions_bottom.parquet",
+    output_filename="Portfolios/FFNN3_decile_portfolios_equal_weight_bottom.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="equal",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN4
+# ==============================================================================
+print("="*110)
+print("FFNN4")
+print("="*110)
+ffnn4_bottom_equal_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output bottom/FFNN4_predictions_bottom.parquet",
+    output_filename="Portfolios/FFNN4_decile_portfolios_equal_weight_bottom.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="equal",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN5
+# ==============================================================================
+print("="*110)
+print("FFNN5")
+print("="*110)
+ffnn5_bottom_equal_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output bottom/FFNN5_predictions_bottom.parquet",
+    output_filename="Portfolios/FFNN5_decile_portfolios_equal_weight_bottom.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="equal",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
 """Non-linear ensemble"""
 
+# ==============================================================================
+# NON-LINEAR ENSEMBLE
+# ==============================================================================
 non_linear_ensemble_bottom_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output bottom/Non_linear_ensemble_predictions_bottom.parquet",
     output_filename="Portfolios/Non_linear_ensemble_decile_portfolios_equal_weight_bottom.parquet",
@@ -11238,6 +14255,9 @@ non_linear_ensemble_bottom_equal_weight_portfolios = create_decile_long_short_po
 Pooled OLS
 """
 
+# ==============================================================================
+# OLS
+# ==============================================================================
 ols_bottom_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output bottom/OLS_predictions_bottom.parquet",
     output_filename="Portfolios/OLS_decile_portfolios_value_weight_bottom.parquet",
@@ -11256,6 +14276,9 @@ ols_bottom_value_weight_portfolios = create_decile_long_short_portfolios(
 
 """OLS-FF3"""
 
+# ==============================================================================
+# OLS-FF3
+# ==============================================================================
 ols_ff3_bottom_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output bottom/OLS_FF3_predictions_bottom.parquet",
     output_filename="Portfolios/OLS_FF3_decile_portfolios_value_weight_bottom.parquet",
@@ -11274,6 +14297,9 @@ ols_ff3_bottom_value_weight_portfolios = create_decile_long_short_portfolios(
 
 """PCR"""
 
+# ==============================================================================
+# PCR
+# ==============================================================================
 pcr_bottom_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output bottom/PCR_predictions_bottom.parquet",
     output_filename="Portfolios/PCR_decile_portfolios_value_weight_bottom.parquet",
@@ -11292,6 +14318,9 @@ pcr_bottom_value_weight_portfolios = create_decile_long_short_portfolios(
 
 """IPCA"""
 
+# ==============================================================================
+# IPCA
+# ==============================================================================
 ipca_bottom_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output bottom/IPCA_predictions_bottom.parquet",
     output_filename="Portfolios/IPCA_decile_portfolios_value_weight_bottom.parquet",
@@ -11310,6 +14339,9 @@ ipca_bottom_value_weight_portfolios = create_decile_long_short_portfolios(
 
 """PLS"""
 
+# ==============================================================================
+# PLS
+# ==============================================================================
 pls_bottom_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output bottom/PLS_predictions_bottom.parquet",
     output_filename="Portfolios/PLS_decile_portfolios_value_weight_bottom.parquet",
@@ -11328,6 +14360,9 @@ pls_bottom_value_weight_portfolios = create_decile_long_short_portfolios(
 
 """Linear ensemble"""
 
+# ==============================================================================
+# LINEAR-ENSEMBLE
+# ==============================================================================
 linear_ensemble_bottom_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output bottom/Linear_ensemble_predictions_bottom.parquet",
     output_filename="Portfolios/Linear_ensemble_decile_portfolios_value_weight_bottom.parquet",
@@ -11346,6 +14381,9 @@ linear_ensemble_bottom_value_weight_portfolios = create_decile_long_short_portfo
 
 """GBRT"""
 
+# ==============================================================================
+# GBRT
+# ==============================================================================
 gbrt_bottom_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output bottom/GBRT_predictions_bottom.parquet",
     output_filename="Portfolios/GBRT_decile_portfolios_value_weight_bottom.parquet",
@@ -11364,6 +14402,9 @@ gbrt_bottom_value_weight_portfolios = create_decile_long_short_portfolios(
 
 """RF"""
 
+# ==============================================================================
+# RF
+# ==============================================================================
 rf_bottom_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output bottom/RF_predictions_bottom.parquet",
     output_filename="Portfolios/RF_decile_portfolios_value_weight_bottom.parquet",
@@ -11380,8 +14421,123 @@ rf_bottom_value_weight_portfolios = create_decile_long_short_portfolios(
     CW_lags=4,
     print_summary=True)
 
+"""FFNN"""
+
+# ==============================================================================
+# FFNN1
+# ==============================================================================
+print("="*110)
+print("FFNN1")
+print("="*110)
+ffnn1_bottom_value_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output bottom/FFNN1_predictions_bottom.parquet",
+    output_filename="Portfolios/FFNN1_decile_portfolios_value_weight_bottom.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="value",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN2
+# ==============================================================================
+print("="*110)
+print("FFNN2")
+print("="*110)
+ffnn2_bottom_value_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output bottom/FFNN2_predictions_bottom.parquet",
+    output_filename="Portfolios/FFNN2_decile_portfolios_value_weight_bottom.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="value",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN3
+# ==============================================================================
+print("="*110)
+print("FFNN3")
+print("="*110)
+ffnn3_bottom_value_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output bottom/FFNN3_predictions_bottom.parquet",
+    output_filename="Portfolios/FFNN3_decile_portfolios_value_weight_bottom.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="value",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN4
+# ==============================================================================
+print("="*110)
+print("FFNN4")
+print("="*110)
+ffnn4_bottom_value_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output bottom/FFNN4_predictions_bottom.parquet",
+    output_filename="Portfolios/FFNN4_decile_portfolios_value_weight_bottom.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="value",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN5
+# ==============================================================================
+print("="*110)
+print("FFNN5")
+print("="*110)
+ffnn5_bottom_value_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output bottom/FFNN5_predictions_bottom.parquet",
+    output_filename="Portfolios/FFNN5_decile_portfolios_value_weight_bottom.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="value",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
 """Non-linear ensemble"""
 
+# ==============================================================================
+# NON-LINEAR ENSEMBLE
+# ==============================================================================
 non_linear_ensemble_bottom_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output bottom/Non_linear_ensemble_predictions_bottom.parquet",
     output_filename="Portfolios/Non_linear_ensemble_decile_portfolios_value_weight_bottom.parquet",
@@ -11405,6 +14561,9 @@ non_linear_ensemble_bottom_value_weight_portfolios = create_decile_long_short_po
 Pooled OLS
 """
 
+# ==============================================================================
+# OLS
+# ==============================================================================
 ols_alternative_industries_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model outpu alternative industries/OLS_predictions_alternative_industries.parquet",
     output_filename="Portfolios/OLS_decile_portfolios_equal_weight_alternative_industries.parquet",
@@ -11423,6 +14582,9 @@ ols_alternative_industries_equal_weight_portfolios = create_decile_long_short_po
 
 """OLS-FF3"""
 
+# ==============================================================================
+# OLS-FF3
+# ==============================================================================
 ols_ff3_alternative_industries_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative industries/OLS_FF3_predictions_alternative_industries.parquet",
     output_filename="Portfolios/OLS_FF3_decile_portfolios_equal_weight_alternative_industries.parquet",
@@ -11441,6 +14603,9 @@ ols_ff3_alternative_industries_equal_weight_portfolios = create_decile_long_shor
 
 """PCR"""
 
+# ==============================================================================
+# PCR
+# ==============================================================================
 pcr_alternative_industries_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative industries/PCR_predictions_alternative_industries.parquet",
     output_filename="Portfolios/PCR_decile_portfolios_equal_weight_alternative_industries.parquet",
@@ -11459,6 +14624,9 @@ pcr_alternative_industries_equal_weight_portfolios = create_decile_long_short_po
 
 """IPCA"""
 
+# ==============================================================================
+# IPCA
+# ==============================================================================
 ipca_alternative_industries_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative industries/IPCA_predictions_alternative_industries.parquet",
     output_filename="Portfolios/IPCA_decile_portfolios_equal_weight_alternative_industries.parquet",
@@ -11477,6 +14645,9 @@ ipca_alternative_industries_equal_weight_portfolios = create_decile_long_short_p
 
 """PLS"""
 
+# ==============================================================================
+# PLS
+# ==============================================================================
 pls_alternative_industries_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative industries/PLS_predictions_alternative_industries.parquet",
     output_filename="Portfolios/PLS_decile_portfolios_equal_weight_alternative_industries.parquet",
@@ -11495,6 +14666,9 @@ pls_alternative_industries_equal_weight_portfolios = create_decile_long_short_po
 
 """Linear ensemble"""
 
+# ==============================================================================
+# LINEAR ENSEMBLE
+# ==============================================================================
 linear_ensemble_alternative_industries_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative industries/Linear_ensemble_predictions_alternative_industries.parquet",
     output_filename="Portfolios/Linear_ensemble_decile_portfolios_equal_weight_alternative_industries.parquet",
@@ -11513,6 +14687,9 @@ linear_ensemble_alternative_industries_equal_weight_portfolios = create_decile_l
 
 """GBRT"""
 
+# ==============================================================================
+# GBRT
+# ==============================================================================
 gbrt_alternative_industries_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative industries/GBRT_predictions_alternative_industries.parquet",
     output_filename="Portfolios/GBRT_decile_portfolios_equal_weight_alternative_industries.parquet",
@@ -11531,6 +14708,9 @@ gbrt_alternative_industries_equal_weight_portfolios = create_decile_long_short_p
 
 """RF"""
 
+# ==============================================================================
+# RF
+# ==============================================================================
 rf_alternative_industries_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative industries/RF_predictions_alternative_industries.parquet",
     output_filename="Portfolios/RF_decile_portfolios_equal_weight_alternative_industries.parquet",
@@ -11547,8 +14727,123 @@ rf_alternative_industries_equal_weight_portfolios = create_decile_long_short_por
     CW_lags=4,
     print_summary=True)
 
+"""FFNN"""
+
+# ==============================================================================
+# FFNN1
+# ==============================================================================
+print("="*110)
+print("FFNN1")
+print("="*110)
+ffnn1_alternative_industries_equal_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output alternative industries/FFNN1_predictions_alternative_industries.parquet",
+    output_filename="Portfolios/FFNN1_decile_portfolios_equal_weight_alternative_industries.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="equal",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN2
+# ==============================================================================
+print("="*110)
+print("FFNN2")
+print("="*110)
+ffnn2_alternative_industries_equal_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output alternative industries/FFNN2_predictions_alternative_industries.parquet",
+    output_filename="Portfolios/FFNN2_decile_portfolios_equal_weight_alternative_industries.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="equal",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN3
+# ==============================================================================
+print("="*110)
+print("FFNN3")
+print("="*110)
+ffnn3_alternative_industries_equal_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output alternative industries/FFNN3_predictions_alternative_industries.parquet",
+    output_filename="Portfolios/FFNN3_decile_portfolios_equal_weight_alternative_industries.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="equal",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN4
+# ==============================================================================
+print("="*110)
+print("FFNN4")
+print("="*110)
+ffnn4_alternative_industries_equal_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output alternative industries/FFNN4_predictions_alternative_industries.parquet",
+    output_filename="Portfolios/FFNN4_decile_portfolios_equal_weight_alternative_industries.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="equal",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN5
+# ==============================================================================
+print("="*110)
+print("FFNN5")
+print("="*110)
+ffnn5_alternative_industries_equal_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output alternative industries/FFNN5_predictions_alternative_industries.parquet",
+    output_filename="Portfolios/FFNN5_decile_portfolios_equal_weight_alternative_industries.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="equal",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
 """Non-linear ensemble"""
 
+# ==============================================================================
+# NON-LINEAR ENSEMBLE
+# ==============================================================================
 non_linear_ensemble_alternative_industries_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative industries/Non_linear_ensemble_predictions_alternative_industries.parquet",
     output_filename="Portfolios/Non_linear_ensemble_decile_portfolios_equal_weight_alternative_industries.parquet",
@@ -11570,6 +14865,9 @@ non_linear_ensemble_alternative_industries_equal_weight_portfolios = create_deci
 Pooled OLS
 """
 
+# ==============================================================================
+# OLS
+# ==============================================================================
 ols_alternative_industries_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative industries/OLS_predictions_alternative_industries.parquet",
     output_filename="Portfolios/OLS_decile_portfolios_value_weight_alternative_industries.parquet",
@@ -11588,6 +14886,9 @@ ols_alternative_industries_value_weight_portfolios = create_decile_long_short_po
 
 """OLS-FF3"""
 
+# ==============================================================================
+# OLS-FF3
+# ==============================================================================
 ols_ff3_alternative_industries_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative industries/OLS_FF3_predictions_alternative_industries.parquet",
     output_filename="Portfolios/OLS_FF3_decile_portfolios_value_weight_alternative_industries.parquet",
@@ -11606,6 +14907,9 @@ ols_ff3_alternative_industries_value_weight_portfolios = create_decile_long_shor
 
 """PCR"""
 
+# ==============================================================================
+# PCR
+# ==============================================================================
 pcr_alternative_industries_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative industries/PCR_predictions_alternative_industries.parquet",
     output_filename="Portfolios/PCR_decile_portfolios_value_weight_alternative_industries.parquet",
@@ -11624,6 +14928,9 @@ pcr_alternative_industries_value_weight_portfolios = create_decile_long_short_po
 
 """IPCA"""
 
+# ==============================================================================
+# IPCA
+# ==============================================================================
 ipca_alternative_industries_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative industries/IPCA_predictions_alternative_industries.parquet",
     output_filename="Portfolios/IPCA_decile_portfolios_value_weight_alternative_industries.parquet",
@@ -11642,6 +14949,9 @@ ipca_alternative_industries_value_weight_portfolios = create_decile_long_short_p
 
 """PLS"""
 
+# ==============================================================================
+# PLS
+# ==============================================================================
 pls_alternative_industries_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative industries/PLS_predictions_alternative_industries.parquet",
     output_filename="Portfolios/PLS_decile_portfolios_value_weight_alternative_industries.parquet",
@@ -11660,6 +14970,9 @@ pls_alternative_industries_value_weight_portfolios = create_decile_long_short_po
 
 """Linear ensemble"""
 
+# ==============================================================================
+# LINEAR ENSEMBLE
+# ==============================================================================
 linear_ensemble_alternative_industries_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative industries/Linear_ensemble_predictions_alternative_industries.parquet",
     output_filename="Portfolios/Linear_ensemble_decile_portfolios_value_weight_alternative_industries.parquet",
@@ -11678,6 +14991,9 @@ linear_ensemble_alternative_industries_value_weight_portfolios = create_decile_l
 
 """GBRT"""
 
+# ==============================================================================
+# GBRT
+# ==============================================================================
 gbrt_alternative_industries_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative industries/GBRT_predictions_alternative_industries.parquet",
     output_filename="Portfolios/GBRT_decile_portfolios_value_weight_alternative_industries.parquet",
@@ -11696,6 +15012,9 @@ gbrt_alternative_industries_value_weight_portfolios = create_decile_long_short_p
 
 """RF"""
 
+# ==============================================================================
+# RF
+# ==============================================================================
 rf_alternative_industries_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative industries/RF_predictions_alternative_industries.parquet",
     output_filename="Portfolios/RF_decile_portfolios_value_weight_alternative_industries.parquet",
@@ -11712,8 +15031,123 @@ rf_alternative_industries_value_weight_portfolios = create_decile_long_short_por
     CW_lags=4,
     print_summary=True)
 
+"""FFNN"""
+
+# ==============================================================================
+# FFNN1
+# ==============================================================================
+print("="*110)
+print("FFNN1")
+print("="*110)
+ffnn1_alternative_industries_value_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output alternative industries/FFNN1_predictions_alternative_industries.parquet",
+    output_filename="Portfolios/FFNN1_decile_portfolios_value_weight_alternative_industries.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="value",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN2
+# ==============================================================================
+print("="*110)
+print("FFNN2")
+print("="*110)
+ffnn2_alternative_industries_value_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output alternative industries/FFNN2_predictions_alternative_industries.parquet",
+    output_filename="Portfolios/FFNN2_decile_portfolios_value_weight_alternative_industries.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="value",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN3
+# ==============================================================================
+print("="*110)
+print("FFNN3")
+print("="*110)
+ffnn3_alternative_industries_value_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output alternative industries/FFNN3_predictions_alternative_industries.parquet",
+    output_filename="Portfolios/FFNN3_decile_portfolios_value_weight_alternative_industries.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="value",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN4
+# ==============================================================================
+print("="*110)
+print("FFNN4")
+print("="*110)
+ffnn4_alternative_industries_value_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output alternative industries/FFNN4_predictions_alternative_industries.parquet",
+    output_filename="Portfolios/FFNN4_decile_portfolios_value_weight_alternative_industries.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="value",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN5
+# ==============================================================================
+print("="*110)
+print("FFNN5")
+print("="*110)
+ffnn5_alternative_industries_value_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output alternative industries/FFNN5_predictions_alternative_industries.parquet",
+    output_filename="Portfolios/FFNN5_decile_portfolios_value_weight_alternative_industries.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="value",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
 """Non-linear ensemble"""
 
+# ==============================================================================
+# NON-LINEAR ENSEMBLE
+# ==============================================================================
 non_linear_ensemble_alternative_industries_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative industries/Non_linear_ensemble_predictions_alternative_industries.parquet",
     output_filename="Portfolios/Non_linear_ensemble_decile_portfolios_value_weight_alternative_industries.parquet",
@@ -11737,6 +15171,9 @@ non_linear_ensemble_alternative_industries_value_weight_portfolios = create_deci
 Pooled OLS
 """
 
+# ==============================================================================
+# OLS
+# ==============================================================================
 ols_alternative_sample_split_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative sample split/OLS_predictions_alternative_sample_split.parquet",
     output_filename="Portfolios/OLS_decile_portfolios_equal_weight_alternative_sample_split.parquet",
@@ -11755,6 +15192,9 @@ ols_alternative_sample_split_equal_weight_portfolios = create_decile_long_short_
 
 """OLS-FF3"""
 
+# ==============================================================================
+# OLS-FF3
+# ==============================================================================
 ols_ff3_alternative_sample_split_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative sample split/OLS_FF3_predictions_alternative_sample_split.parquet",
     output_filename="Portfolios/OLS_FF3_decile_portfolios_equal_weight_alternative_sample_split.parquet",
@@ -11773,6 +15213,9 @@ ols_ff3_alternative_sample_split_equal_weight_portfolios = create_decile_long_sh
 
 """PCR"""
 
+# ==============================================================================
+# PCR
+# ==============================================================================
 pcr_alternative_sample_split_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative sample split/PCR_predictions_alternative_sample_split.parquet",
     output_filename="Portfolios/PCR_decile_portfolios_equal_weight_alternative_sample_split.parquet",
@@ -11791,6 +15234,9 @@ pcr_alternative_sample_split_equal_weight_portfolios = create_decile_long_short_
 
 """IPCA"""
 
+# ==============================================================================
+# IPCA
+# ==============================================================================
 ipca_alternative_sample_split_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative sample split/IPCA_predictions_alternative_sample_split.parquet",
     output_filename="Portfolios/IPCA_decile_portfolios_equal_weight_alternative_sample_split.parquet",
@@ -11809,6 +15255,9 @@ ipca_alternative_sample_split_equal_weight_portfolios = create_decile_long_short
 
 """PLS"""
 
+# ==============================================================================
+# PLS
+# ==============================================================================
 pls_alternative_sample_split_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative sample split/PLS_predictions_alternative_sample_split.parquet",
     output_filename="Portfolios/PLS_decile_portfolios_equal_weight_alternative_sample_split.parquet",
@@ -11827,6 +15276,9 @@ pls_alternative_sample_split_equal_weight_portfolios = create_decile_long_short_
 
 """Linear ensemble"""
 
+# ==============================================================================
+# LINEAR ENSEMBLE
+# ==============================================================================
 linear_ensemble_alternative_sample_split_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative sample split/Linear_ensemble_predictions_alternative_sample_split.parquet",
     output_filename="Portfolios/Linear_ensemble_decile_portfolios_equal_weight_alternative_sample_split.parquet",
@@ -11845,6 +15297,9 @@ linear_ensemble_alternative_sample_split_equal_weight_portfolios = create_decile
 
 """GBRT"""
 
+# ==============================================================================
+# GBRT
+# ==============================================================================
 gbrt_alternative_sample_split_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative sample split/GBRT_predictions_alternative_sample_split.parquet",
     output_filename="Portfolios/GBRT_decile_portfolios_equal_weight_alternative_sample_split.parquet",
@@ -11863,6 +15318,9 @@ gbrt_alternative_sample_split_equal_weight_portfolios = create_decile_long_short
 
 """RF"""
 
+# ==============================================================================
+# RF
+# ==============================================================================
 rf_alternative_sample_split_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative sample split/RF_predictions_alternative_sample_split.parquet",
     output_filename="Portfolios/RF_decile_portfolios_equal_weight_alternative_sample_split.parquet",
@@ -11879,8 +15337,123 @@ rf_alternative_sample_split_equal_weight_portfolios = create_decile_long_short_p
     CW_lags=4,
     print_summary=True)
 
+"""FFNN"""
+
+# ==============================================================================
+# FFNN1
+# ==============================================================================
+print("="*110)
+print("FFNN1")
+print("="*110)
+ffnn1_alternative_sample_split_equal_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output alternative sample split/FFNN1_predictions_alternative_sample_split.parquet",
+    output_filename="Portfolios/FFNN1_decile_portfolios_equal_weight_alternative_sample_split.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="equal",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN2
+# ==============================================================================
+print("="*110)
+print("FFNN2")
+print("="*110)
+ffnn2_alternative_sample_split_equal_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output alternative sample split/FFNN2_predictions_alternative_sample_split.parquet",
+    output_filename="Portfolios/FFNN2_decile_portfolios_equal_weight_alternative_sample_split.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="equal",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN3
+# ==============================================================================
+print("="*110)
+print("FFNN3")
+print("="*110)
+ffnn3_alternative_sample_split_equal_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output alternative sample split/FFNN3_predictions_alternative_sample_split.parquet",
+    output_filename="Portfolios/FFNN3_decile_portfolios_equal_weight_alternative_sample_split.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="equal",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN4
+# ==============================================================================
+print("="*110)
+print("FFNN4")
+print("="*110)
+ffnn4_alternative_sample_split_equal_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output alternative sample split/FFNN4_predictions_alternative_sample_split.parquet",
+    output_filename="Portfolios/FFNN4_decile_portfolios_equal_weight_alternative_sample_split.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="equal",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN5
+# ==============================================================================
+print("="*110)
+print("FFNN5")
+print("="*110)
+ffnn5_alternative_sample_split_equal_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output alternative sample split/FFNN5_predictions_alternative_sample_split.parquet",
+    output_filename="Portfolios/FFNN5_decile_portfolios_equal_weight_alternative_sample_split.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="equal",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
 """Non-linear ensemble"""
 
+# ==============================================================================
+# NON-LINEAR ENSEMBLE
+# ==============================================================================
 non_linear_ensemble_alternative_sample_split_equal_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative sample split/Non_linear_ensemble_predictions_alternative_sample_split.parquet",
     output_filename="Portfolios/Non_linear_ensemble_decile_portfolios_equal_weight_alternative_sample_split.parquet",
@@ -11902,6 +15475,9 @@ non_linear_ensemble_alternative_sample_split_equal_weight_portfolios = create_de
 Pooled OLS
 """
 
+# ==============================================================================
+# OLS
+# ==============================================================================
 ols_alternative_sample_split_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative sample split/OLS_predictions_alternative_sample_split.parquet",
     output_filename="Portfolios/OLS_decile_portfolios_value_weight_alternative_sample_split.parquet",
@@ -11920,6 +15496,9 @@ ols_alternative_sample_split_value_weight_portfolios = create_decile_long_short_
 
 """OLS-FF3"""
 
+# ==============================================================================
+# OLS-FF3
+# ==============================================================================
 ols_ff3_alternative_sample_split_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative sample split/OLS_FF3_predictions_alternative_sample_split.parquet",
     output_filename="Portfolios/OLS_FF3_decile_portfolios_value_weight_alternative_sample_split.parquet",
@@ -11938,6 +15517,9 @@ ols_ff3_alternative_sample_split_value_weight_portfolios = create_decile_long_sh
 
 """PCR"""
 
+# ==============================================================================
+# PCR
+# ==============================================================================
 pcr_alternative_sample_split_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative sample split/PCR_predictions_alternative_sample_split.parquet",
     output_filename="Portfolios/PCR_decile_portfolios_value_weight_alternative_sample_split.parquet",
@@ -11956,6 +15538,9 @@ pcr_alternative_sample_split_value_weight_portfolios = create_decile_long_short_
 
 """IPCA"""
 
+# ==============================================================================
+# IPCA
+# ==============================================================================
 ipca_alternative_sample_split_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative sample split/IPCA_predictions_alternative_sample_split.parquet",
     output_filename="Portfolios/IPCA_decile_portfolios_value_weight_alternative_sample_split.parquet",
@@ -11974,6 +15559,9 @@ ipca_alternative_sample_split_value_weight_portfolios = create_decile_long_short
 
 """PLS"""
 
+# ==============================================================================
+# PLS
+# ==============================================================================
 pls_alternative_sample_split_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative sample split/PLS_predictions_alternative_sample_split.parquet",
     output_filename="Portfolios/PLS_decile_portfolios_value_weight_alternative_sample_split.parquet",
@@ -11992,6 +15580,9 @@ pls_alternative_sample_split_value_weight_portfolios = create_decile_long_short_
 
 """Linear ensemble"""
 
+# ==============================================================================
+# LINEAR ENSEMBLE
+# ==============================================================================
 linear_ensemble_alternative_sample_split_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative sample split/Linear_ensemble_predictions_alternative_sample_split.parquet",
     output_filename="Portfolios/Linear_ensemble_decile_portfolios_value_weight_alternative_sample_split.parquet",
@@ -12010,6 +15601,9 @@ linear_ensemble_alternative_sample_split_value_weight_portfolios = create_decile
 
 """GBRT"""
 
+# ==============================================================================
+# GBRT
+# ==============================================================================
 gbrt_alternative_sample_split_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative sample split/GBRT_predictions_alternative_sample_split.parquet",
     output_filename="Portfolios/GBRT_decile_portfolios_value_weight_alternative_sample_split.parquet",
@@ -12028,6 +15622,9 @@ gbrt_alternative_sample_split_value_weight_portfolios = create_decile_long_short
 
 """RF"""
 
+# ==============================================================================
+# RF
+# ==============================================================================
 rf_alternative_sample_split_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative sample split/RF_predictions_alternative_sample_split.parquet",
     output_filename="Portfolios/RF_decile_portfolios_value_weight_alternative_sample_split.parquet",
@@ -12044,8 +15641,123 @@ rf_alternative_sample_split_value_weight_portfolios = create_decile_long_short_p
     CW_lags=4,
     print_summary=True)
 
+"""FFNN"""
+
+# ==============================================================================
+# FFNN1
+# ==============================================================================
+print("="*110)
+print("FFNN1")
+print("="*110)
+ffnn1_alternative_sample_split_value_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output alternative sample split/FFNN1_predictions_alternative_sample_split.parquet",
+    output_filename="Portfolios/FFNN1_decile_portfolios_value_weight_alternative_sample_split.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="value",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN2
+# ==============================================================================
+print("="*110)
+print("FFNN2")
+print("="*110)
+ffnn2_alternative_sample_split_value_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output alternative sample split/FFNN2_predictions_alternative_sample_split.parquet",
+    output_filename="Portfolios/FFNN2_decile_portfolios_value_weight_alternative_sample_split.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="value",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN3
+# ==============================================================================
+print("="*110)
+print("FFNN3")
+print("="*110)
+ffnn3_alternative_sample_split_value_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output alternative sample split/FFNN3_predictions_alternative_sample_split.parquet",
+    output_filename="Portfolios/FFNN3_decile_portfolios_value_weight_alternative_sample_split.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="value",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN4
+# ==============================================================================
+print("="*110)
+print("FFNN4")
+print("="*110)
+ffnn4_alternative_sample_split_value_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output alternative sample split/FFNN4_predictions_alternative_sample_split.parquet",
+    output_filename="Portfolios/FFNN4_decile_portfolios_value_weight_alternative_sample_split.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="value",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
+# ==============================================================================
+# FFNN5
+# ==============================================================================
+print("="*110)
+print("FFNN5")
+print("="*110)
+ffnn5_alternative_sample_split_value_weight_portfolios = create_decile_long_short_portfolios(
+    input_filename="Model output alternative sample split/FFNN5_predictions_alternative_sample_split.parquet",
+    output_filename="Portfolios/FFNN5_decile_portfolios_value_weight_alternative_sample_split.parquet",
+    portfolio_output_dir="Portfolios",
+    weighting="value",
+    market_equity_filename="Raw data/SIC_and_ME.csv",
+    bid_ask_filename="Raw data/bid_ask.csv",
+    me_col="me",
+    bid_col="bid",
+    ask_col="ask",
+    use_lagged_me=True,
+    PSR_benchmark=0.138744,
+    CW_benchmark=0.0,
+    CW_lags=4,
+    print_summary=True)
+
 """Non-linear ensemble"""
 
+# ==============================================================================
+# NON-LINEAR ENSEMBLE
+# ==============================================================================
 non_linear_ensemble_alternative_sample_split_value_weight_portfolios = create_decile_long_short_portfolios(
     input_filename="Model output alternative sample split/Non_linear_ensemble_predictions_alternative_sample_split.parquet",
     output_filename="Portfolios/Non_linear_ensemble_decile_portfolios_value_weight_alternative_sample_split.parquet",
@@ -12075,10 +15787,15 @@ risk_adjusted_performance = display_risk_adjusted_performance(
         "PCR_eq": "Portfolios/PCR_decile_portfolios_equal_weight.parquet",
         "IPCA_eq": "Portfolios/IPCA_decile_portfolios_equal_weight.parquet",
         "PLS_eq": "Portfolios/PLS_decile_portfolios_equal_weight.parquet",
-        "Linear_Ensemble_eq": "Portfolios/Linear_ensemble_decile_portfolios_equal_weight.parquet",
+        "Linear_ensemble_eq": "Portfolios/Linear_ensemble_decile_portfolios_equal_weight.parquet",
         "GBRT_eq": "Portfolios/GBRT_decile_portfolios_equal_weight.parquet",
         "RF_eq": "Portfolios/RF_decile_portfolios_equal_weight.parquet",
-        "NonLinear_Ensemble_eq": "Portfolios/Non_linear_ensemble_decile_portfolios_equal_weight.parquet",
+        "FFNN1_eq": "Portfolios/FFNN1_decile_portfolios_equal_weight.parquet",
+        "FFNN2_eq": "Portfolios/FFNN2_decile_portfolios_equal_weight.parquet",
+        "FFNN3_eq": "Portfolios/FFNN3_decile_portfolios_equal_weight.parquet",
+        "FFNN4_eq": "Portfolios/FFNN4_decile_portfolios_equal_weight.parquet",
+        "FFNN5_eq": "Portfolios/FFNN5_decile_portfolios_equal_weight.parquet",
+        "Non_linear_ensemble_eq": "Portfolios/Non_linear_ensemble_decile_portfolios_equal_weight.parquet",
 
         # Value weight
         "OLS_vw": "Portfolios/OLS_decile_portfolios_value_weight.parquet",
@@ -12086,10 +15803,15 @@ risk_adjusted_performance = display_risk_adjusted_performance(
         "PCR_vw": "Portfolios/PCR_decile_portfolios_value_weight.parquet",
         "IPCA_vw": "Portfolios/IPCA_decile_portfolios_value_weight.parquet",
         "PLS_vw": "Portfolios/PLS_decile_portfolios_value_weight.parquet",
-        "Linear_Ensemble_vw": "Portfolios/Linear_ensemble_decile_portfolios_value_weight.parquet",
+        "Linear_ensemble_vw": "Portfolios/Linear_ensemble_decile_portfolios_value_weight.parquet",
         "GBRT_vw": "Portfolios/GBRT_decile_portfolios_value_weight.parquet",
         "RF_vw": "Portfolios/RF_decile_portfolios_value_weight.parquet",
-        "NonLinear_Ensemble_vw": "Portfolios/Non_linear_ensemble_decile_portfolios_value_weight.parquet"})
+        "FFNN1_vw": "Portfolios/FFNN1_decile_portfolios_value_weight.parquet",
+        "FFNN2_vw": "Portfolios/FFNN2_decile_portfolios_value_weight.parquet",
+        "FFNN3_vw": "Portfolios/FFNN3_decile_portfolios_value_weight.parquet",
+        "FFNN4_vw": "Portfolios/FFNN4_decile_portfolios_value_weight.parquet",
+        "FFNN5_vw": "Portfolios/FFNN5_decile_portfolios_value_weight.parquet",
+        "Non_linear_ensemble_vw": "Portfolios/Non_linear_ensemble_decile_portfolios_value_weight.parquet"})
 
 """Winsorizing"""
 
@@ -12101,10 +15823,15 @@ risk_adjusted_performance = display_risk_adjusted_performance(
         "PCR_eq": "Portfolios/PCR_decile_portfolios_equal_weight_winsorized.parquet",
         "IPCA_eq": "Portfolios/IPCA_decile_portfolios_equal_weight_winsorized.parquet",
         "PLS_eq": "Portfolios/PLS_decile_portfolios_equal_weight_winsorized.parquet",
-        "Linear_Ensemble_eq": "Portfolios/Linear_ensemble_decile_portfolios_equal_weight_winsorized.parquet",
+        "Linear_ensemble_eq": "Portfolios/Linear_ensemble_decile_portfolios_equal_weight_winsorized.parquet",
         "GBRT_eq": "Portfolios/GBRT_decile_portfolios_equal_weight_winsorized.parquet",
         "RF_eq": "Portfolios/RF_decile_portfolios_equal_weight_winsorized.parquet",
-        "NonLinear_Ensemble_eq": "Portfolios/Non_linear_ensemble_decile_portfolios_equal_weight_winsorized.parquet",
+        "FFNN1_eq": "Portfolios/FFNN1_decile_portfolios_equal_weight_winsorized.parquet",
+        "FFNN2_eq": "Portfolios/FFNN2_decile_portfolios_equal_weight_winsorized.parquet",
+        "FFNN3_eq": "Portfolios/FFNN3_decile_portfolios_equal_weight_winsorized.parquet",
+        "FFNN4_eq": "Portfolios/FFNN4_decile_portfolios_equal_weight_winsorized.parquet",
+        "FFNN5_eq": "Portfolios/FFNN5_decile_portfolios_equal_weight_winsorized.parquet",
+        "Non_linear_ensemble_eq": "Portfolios/Non_linear_ensemble_decile_portfolios_equal_weight_winsorized.parquet",
 
         # Value weight
         "OLS_vw": "Portfolios/OLS_decile_portfolios_value_weight_winsorized.parquet",
@@ -12112,10 +15839,15 @@ risk_adjusted_performance = display_risk_adjusted_performance(
         "PCR_vw": "Portfolios/PCR_decile_portfolios_value_weight_winsorized.parquet",
         "IPCA_vw": "Portfolios/IPCA_decile_portfolios_value_weight_winsorized.parquet",
         "PLS_vw": "Portfolios/PLS_decile_portfolios_value_weight_winsorized.parquet",
-        "Linear_Ensemble_vw": "Portfolios/Linear_ensemble_decile_portfolios_value_weight_winsorized.parquet",
+        "Linear_ensemble_vw": "Portfolios/Linear_ensemble_decile_portfolios_value_weight_winsorized.parquet",
         "GBRT_vw": "Portfolios/GBRT_decile_portfolios_value_weight_winsorized.parquet",
         "RF_vw": "Portfolios/RF_decile_portfolios_value_weight_winsorized.parquet",
-        "NonLinear_Ensemble_vw": "Portfolios/Non_linear_ensemble_decile_portfolios_value_weight_winsorized.parquet"})
+        "FFNN1_vw": "Portfolios/FFNN1_decile_portfolios_value_weight_winsorized.parquet",
+        "FFNN2_vw": "Portfolios/FFNN2_decile_portfolios_value_weight_winsorized.parquet",
+        "FFNN3_vw": "Portfolios/FFNN3_decile_portfolios_value_weight_winsorized.parquet",
+        "FFNN4_vw": "Portfolios/FFNN4_decile_portfolios_value_weight_winsorized.parquet",
+        "FFNN5_vw": "Portfolios/FFNN5_decile_portfolios_value_weight_winsorized.parquet",
+        "Non_linear_ensemble_vw": "Portfolios/Non_linear_ensemble_decile_portfolios_value_weight_winsorized.parquet"})
 
 """Alternative data"""
 
@@ -12127,10 +15859,15 @@ risk_adjusted_performance = display_risk_adjusted_performance(
         "PCR_eq": "Portfolios/PCR_decile_portfolios_equal_weight_alternative_data.parquet",
         "IPCA_eq": "Portfolios/IPCA_decile_portfolios_equal_weight_alternative_data.parquet",
         "PLS_eq": "Portfolios/PLS_decile_portfolios_equal_weight_alternative_data.parquet",
-        "Linear_Ensemble_eq": "Portfolios/Linear_ensemble_decile_portfolios_equal_weight_alternative_data.parquet",
+        "Linear_ensemble_eq": "Portfolios/Linear_ensemble_decile_portfolios_equal_weight_alternative_data.parquet",
         "GBRT_eq": "Portfolios/GBRT_decile_portfolios_equal_weight_alternative_data.parquet",
         "RF_eq": "Portfolios/RF_decile_portfolios_equal_weight_alternative_data.parquet",
-        "NonLinear_Ensemble_eq": "Portfolios/Non_linear_ensemble_decile_portfolios_equal_weight_alternative_data.parquet",
+        "FFNN1_eq": "Portfolios/FFNN1_decile_portfolios_equal_weight_alternative_data.parquet",
+        "FFNN2_eq": "Portfolios/FFNN2_decile_portfolios_equal_weight_alternative_data.parquet",
+        "FFNN3_eq": "Portfolios/FFNN3_decile_portfolios_equal_weight_alternative_data.parquet",
+        "FFNN4_eq": "Portfolios/FFNN4_decile_portfolios_equal_weight_alternative_data.parquet",
+        "FFNN5_eq": "Portfolios/FFNN5_decile_portfolios_equal_weight_alternative_data.parquet",
+        "Non_linear_ensemble_eq": "Portfolios/Non_linear_ensemble_decile_portfolios_equal_weight_alternative_data.parquet",
 
         # Value weight
         "OLS_vw": "Portfolios/OLS_decile_portfolios_value_weight_alternative_data.parquet",
@@ -12138,10 +15875,15 @@ risk_adjusted_performance = display_risk_adjusted_performance(
         "PCR_vw": "Portfolios/PCR_decile_portfolios_value_weight_alternative_data.parquet",
         "IPCA_vw": "Portfolios/IPCA_decile_portfolios_value_weight_alternative_data.parquet",
         "PLS_vw": "Portfolios/PLS_decile_portfolios_value_weight_alternative_data.parquet",
-        "Linear_Ensemble_vw": "Portfolios/Linear_ensemble_decile_portfolios_value_weight_alternative_data.parquet",
+        "Linear_ensemble_vw": "Portfolios/Linear_ensemble_decile_portfolios_value_weight_alternative_data.parquet",
         "GBRT_vw": "Portfolios/GBRT_decile_portfolios_value_weight_alternative_data.parquet",
         "RF_vw": "Portfolios/RF_decile_portfolios_value_weight_alternative_data.parquet",
-        "NonLinear_Ensemble_vw": "Portfolios/Non_linear_ensemble_decile_portfolios_value_weight_alternative_data.parquet"})
+        "FFNN1_vw": "Portfolios/FFNN1_decile_portfolios_value_weight_alternative_data.parquet",
+        "FFNN2_vw": "Portfolios/FFNN2_decile_portfolios_value_weight_alternative_data.parquet",
+        "FFNN3_vw": "Portfolios/FFNN3_decile_portfolios_value_weight_alternative_data.parquet",
+        "FFNN4_vw": "Portfolios/FFNN4_decile_portfolios_value_weight_alternative_data.parquet",
+        "FFNN5_vw": "Portfolios/FFNN5_decile_portfolios_value_weight_alternative_data.parquet",
+        "Non_linear_ensemble_vw": "Portfolios/Non_linear_ensemble_decile_portfolios_value_weight_alternative_data.parquet"})
 
 """Top universe"""
 
@@ -12153,10 +15895,15 @@ risk_adjusted_performance = display_risk_adjusted_performance(
         "PCR_eq": "Portfolios/PCR_decile_portfolios_equal_weight_top.parquet",
         "IPCA_eq": "Portfolios/IPCA_decile_portfolios_equal_weight_top.parquet",
         "PLS_eq": "Portfolios/PLS_decile_portfolios_equal_weight_top.parquet",
-        "Linear_Ensemble_eq": "Portfolios/Linear_ensemble_decile_portfolios_equal_weight_top.parquet",
+        "Linear_ensemble_eq": "Portfolios/Linear_ensemble_decile_portfolios_equal_weight_top.parquet",
         "GBRT_eq": "Portfolios/GBRT_decile_portfolios_equal_weight_top.parquet",
         "RF_eq": "Portfolios/RF_decile_portfolios_equal_weight_top.parquet",
-        "NonLinear_Ensemble_eq": "Portfolios/Non_linear_ensemble_decile_portfolios_equal_weight_top.parquet",
+        "FFNN1_eq": "Portfolios/FFNN1_decile_portfolios_equal_weight_top.parquet",
+        "FFNN2_eq": "Portfolios/FFNN2_decile_portfolios_equal_weight_top.parquet",
+        "FFNN3_eq": "Portfolios/FFNN3_decile_portfolios_equal_weight_top.parquet",
+        "FFNN4_eq": "Portfolios/FFNN4_decile_portfolios_equal_weight_top.parquet",
+        "FFNN5_eq": "Portfolios/FFNN5_decile_portfolios_equal_weight_top.parquet",
+        "Non_linear_ensemble_eq": "Portfolios/Non_linear_ensemble_decile_portfolios_equal_weight_top.parquet",
 
         # Value weight
         "OLS_vw": "Portfolios/OLS_decile_portfolios_value_weight_top.parquet",
@@ -12164,10 +15911,15 @@ risk_adjusted_performance = display_risk_adjusted_performance(
         "PCR_vw": "Portfolios/PCR_decile_portfolios_value_weight_top.parquet",
         "IPCA_vw": "Portfolios/IPCA_decile_portfolios_value_weight_top.parquet",
         "PLS_vw": "Portfolios/PLS_decile_portfolios_value_weight_top.parquet",
-        "Linear_Ensemble_vw": "Portfolios/Linear_ensemble_decile_portfolios_value_weight_top.parquet",
+        "Linear_ensemble_vw": "Portfolios/Linear_ensemble_decile_portfolios_value_weight_top.parquet",
         "GBRT_vw": "Portfolios/GBRT_decile_portfolios_value_weight_top.parquet",
         "RF_vw": "Portfolios/RF_decile_portfolios_value_weight_top.parquet",
-        "NonLinear_Ensemble_vw": "Portfolios/Non_linear_ensemble_decile_portfolios_value_weight_top.parquet"})
+        "FFNN1_vw": "Portfolios/FFNN1_decile_portfolios_value_weight_top.parquet",
+        "FFNN2_vw": "Portfolios/FFNN2_decile_portfolios_value_weight_top.parquet",
+        "FFNN3_vw": "Portfolios/FFNN3_decile_portfolios_value_weight_top.parquet",
+        "FFNN4_vw": "Portfolios/FFNN4_decile_portfolios_value_weight_top.parquet",
+        "FFNN5_vw": "Portfolios/FFNN5_decile_portfolios_value_weight_top.parquet",
+        "Non_linear_ensemble_vw": "Portfolios/Non_linear_ensemble_decile_portfolios_value_weight_top.parquet"})
 
 """Bottom universe"""
 
@@ -12179,10 +15931,15 @@ risk_adjusted_performance = display_risk_adjusted_performance(
         "PCR_eq": "Portfolios/PCR_decile_portfolios_equal_weight_bottom.parquet",
         "IPCA_eq": "Portfolios/IPCA_decile_portfolios_equal_weight_bottom.parquet",
         "PLS_eq": "Portfolios/PLS_decile_portfolios_equal_weight_bottom.parquet",
-        "Linear_Ensemble_eq": "Portfolios/Linear_ensemble_decile_portfolios_equal_weight_bottom.parquet",
+        "Linear_ensemble_eq": "Portfolios/Linear_ensemble_decile_portfolios_equal_weight_bottom.parquet",
         "GBRT_eq": "Portfolios/GBRT_decile_portfolios_equal_weight_bottom.parquet",
         "RF_eq": "Portfolios/RF_decile_portfolios_equal_weight_bottom.parquet",
-        "NonLinear_Ensemble_eq": "Portfolios/Non_linear_ensemble_decile_portfolios_equal_weight_bottom.parquet",
+        "FFNN1_eq": "Portfolios/FFNN1_decile_portfolios_equal_weight_bottom.parquet",
+        "FFNN2_eq": "Portfolios/FFNN2_decile_portfolios_equal_weight_bottom.parquet",
+        "FFNN3_eq": "Portfolios/FFNN3_decile_portfolios_equal_weight_bottom.parquet",
+        "FFNN4_eq": "Portfolios/FFNN4_decile_portfolios_equal_weight_bottom.parquet",
+        "FFNN5_eq": "Portfolios/FFNN5_decile_portfolios_equal_weight_bottom.parquet",
+        "Non_linear_ensemble_eq": "Portfolios/Non_linear_ensemble_decile_portfolios_equal_weight_bottom.parquet",
 
         # Value weight
         "OLS_vw": "Portfolios/OLS_decile_portfolios_value_weight_bottom.parquet",
@@ -12190,10 +15947,15 @@ risk_adjusted_performance = display_risk_adjusted_performance(
         "PCR_vw": "Portfolios/PCR_decile_portfolios_value_weight_bottom.parquet",
         "IPCA_vw": "Portfolios/IPCA_decile_portfolios_value_weight_bottom.parquet",
         "PLS_vw": "Portfolios/PLS_decile_portfolios_value_weight_bottom.parquet",
-        "Linear_Ensemble_vw": "Portfolios/Linear_ensemble_decile_portfolios_value_weight_bottom.parquet",
+        "Linear_ensemble_vw": "Portfolios/Linear_ensemble_decile_portfolios_value_weight_bottom.parquet",
         "GBRT_vw": "Portfolios/GBRT_decile_portfolios_value_weight_bottom.parquet",
         "RF_vw": "Portfolios/RF_decile_portfolios_value_weight_bottom.parquet",
-        "NonLinear_Ensemble_vw": "Portfolios/Non_linear_ensemble_decile_portfolios_value_weight_bottom.parquet"})
+        "FFNN1_vw": "Portfolios/FFNN1_decile_portfolios_value_weight_bottom.parquet",
+        "FFNN2_vw": "Portfolios/FFNN2_decile_portfolios_value_weight_bottom.parquet",
+        "FFNN3_vw": "Portfolios/FFNN3_decile_portfolios_value_weight_bottom.parquet",
+        "FFNN4_vw": "Portfolios/FFNN4_decile_portfolios_value_weight_bottom.parquet",
+        "FFNN5_vw": "Portfolios/FFNN5_decile_portfolios_value_weight_bottom.parquet",
+        "Non_linear_ensemble_vw": "Portfolios/Non_linear_ensemble_decile_portfolios_value_weight_bottom.parquet"})
 
 """Alternative industries"""
 
@@ -12205,10 +15967,15 @@ risk_adjusted_performance = display_risk_adjusted_performance(
         "PCR_eq": "Portfolios/PCR_decile_portfolios_equal_weight_alternative_industries.parquet",
         "IPCA_eq": "Portfolios/IPCA_decile_portfolios_equal_weight_alternative_industries.parquet",
         "PLS_eq": "Portfolios/PLS_decile_portfolios_equal_weight_alternative_industries.parquet",
-        "Linear_Ensemble_eq": "Portfolios/Linear_ensemble_decile_portfolios_equal_weight_alternative_industries.parquet",
+        "Linear_ensemble_eq": "Portfolios/Linear_ensemble_decile_portfolios_equal_weight_alternative_industries.parquet",
         "GBRT_eq": "Portfolios/GBRT_decile_portfolios_equal_weight_alternative_industries.parquet",
         "RF_eq": "Portfolios/RF_decile_portfolios_equal_weight_alternative_industries.parquet",
-        "NonLinear_Ensemble_eq": "Portfolios/Non_linear_ensemble_decile_portfolios_equal_weight_alternative_industries.parquet",
+        "FFNN1_eq": "Portfolios/FFNN1_decile_portfolios_equal_weight_alternative_industries.parquet",
+        "FFNN2_eq": "Portfolios/FFNN2_decile_portfolios_equal_weight_alternative_industries.parquet",
+        "FFNN3_eq": "Portfolios/FFNN3_decile_portfolios_equal_weight_alternative_industries.parquet",
+        "FFNN4_eq": "Portfolios/FFNN4_decile_portfolios_equal_weight_alternative_industries.parquet",
+        "FFNN5_eq": "Portfolios/FFNN5_decile_portfolios_equal_weight_alternative_industries.parquet",
+        "Non_linear_ensemble_eq": "Portfolios/Non_linear_ensemble_decile_portfolios_equal_weight_alternative_industries.parquet",
 
         # Value weight
         "OLS_vw": "Portfolios/OLS_decile_portfolios_value_weight_alternative_industries.parquet",
@@ -12216,10 +15983,15 @@ risk_adjusted_performance = display_risk_adjusted_performance(
         "PCR_vw": "Portfolios/PCR_decile_portfolios_value_weight_alternative_industries.parquet",
         "IPCA_vw": "Portfolios/IPCA_decile_portfolios_value_weight_alternative_industries.parquet",
         "PLS_vw": "Portfolios/PLS_decile_portfolios_value_weight_alternative_industries.parquet",
-        "Linear_Ensemble_vw": "Portfolios/Linear_ensemble_decile_portfolios_value_weight_alternative_industries.parquet",
+        "Linear_ensemble_vw": "Portfolios/Linear_ensemble_decile_portfolios_value_weight_alternative_industries.parquet",
         "GBRT_vw": "Portfolios/GBRT_decile_portfolios_value_weight_alternative_industries.parquet",
         "RF_vw": "Portfolios/RF_decile_portfolios_value_weight_alternative_industries.parquet",
-        "NonLinear_Ensemble_vw": "Portfolios/Non_linear_ensemble_decile_portfolios_value_weight_alternative_industries.parquet"})
+        "FFNN1_vw": "Portfolios/FFNN1_decile_portfolios_value_weight_alternative_industries.parquet",
+        "FFNN2_vw": "Portfolios/FFNN2_decile_portfolios_value_weight_alternative_industries.parquet",
+        "FFNN3_vw": "Portfolios/FFNN3_decile_portfolios_value_weight_alternative_industries.parquet",
+        "FFNN4_vw": "Portfolios/FFNN4_decile_portfolios_value_weight_alternative_industries.parquet",
+        "FFNN5_vw": "Portfolios/FFNN5_decile_portfolios_value_weight_alternative_industries.parquet",
+        "Non_linear_ensemble_vw": "Portfolios/Non_linear_ensemble_decile_portfolios_value_weight_alternative_industries.parquet"})
 
 """Alternative sample split"""
 
@@ -12231,10 +16003,15 @@ risk_adjusted_performance = display_risk_adjusted_performance(
         "PCR_eq": "Portfolios/PCR_decile_portfolios_equal_weight_alternative_sample_split.parquet",
         "IPCA_eq": "Portfolios/IPCA_decile_portfolios_equal_weight_alternative_sample_split.parquet",
         "PLS_eq": "Portfolios/PLS_decile_portfolios_equal_weight_alternative_sample_split.parquet",
-        "Linear_Ensemble_eq": "Portfolios/Linear_ensemble_decile_portfolios_equal_weight_alternative_sample_split.parquet",
+        "Linear_ensemble_eq": "Portfolios/Linear_ensemble_decile_portfolios_equal_weight_alternative_sample_split.parquet",
         "GBRT_eq": "Portfolios/GBRT_decile_portfolios_equal_weight_alternative_sample_split.parquet",
         "RF_eq": "Portfolios/RF_decile_portfolios_equal_weight_alternative_sample_split.parquet",
-        "NonLinear_Ensemble_eq": "Portfolios/Non_linear_ensemble_decile_portfolios_equal_weight_alternative_sample_split.parquet",
+        "FFNN1_eq": "Portfolios/FFNN1_decile_portfolios_equal_weight_alternative_sample_split.parquet",
+        "FFNN2_eq": "Portfolios/FFNN2_decile_portfolios_equal_weight_alternative_sample_split.parquet",
+        "FFNN3_eq": "Portfolios/FFNN3_decile_portfolios_equal_weight_alternative_sample_split.parquet",
+        "FFNN4_eq": "Portfolios/FFNN4_decile_portfolios_equal_weight_alternative_sample_split.parquet",
+        "FFNN5_eq": "Portfolios/FFNN5_decile_portfolios_equal_weight_alternative_sample_split.parquet",
+        "Non_linear_ensemble_eq": "Portfolios/Non_linear_ensemble_decile_portfolios_equal_weight_alternative_sample_split.parquet",
 
         # Value weight
         "OLS_vw": "Portfolios/OLS_decile_portfolios_value_weight_alternative_sample_split.parquet",
@@ -12242,10 +16019,15 @@ risk_adjusted_performance = display_risk_adjusted_performance(
         "PCR_vw": "Portfolios/PCR_decile_portfolios_value_weight_alternative_sample_split.parquet",
         "IPCA_vw": "Portfolios/IPCA_decile_portfolios_value_weight_alternative_sample_split.parquet",
         "PLS_vw": "Portfolios/PLS_decile_portfolios_value_weight_alternative_sample_split.parquet",
-        "Linear_Ensemble_vw": "Portfolios/Linear_ensemble_decile_portfolios_value_weight_alternative_sample_split.parquet",
+        "Linear_ensemble_vw": "Portfolios/Linear_ensemble_decile_portfolios_value_weight_alternative_sample_split.parquet",
         "GBRT_vw": "Portfolios/GBRT_decile_portfolios_value_weight_alternative_sample_split.parquet",
         "RF_vw": "Portfolios/RF_decile_portfolios_value_weight_alternative_sample_split.parquet",
-        "NonLinear_Ensemble_vw": "Portfolios/Non_linear_ensemble_decile_portfolios_value_weight_alternative_sample_split.parquet"})
+        "FFNN1_vw": "Portfolios/FFNN1_decile_portfolios_value_weight_alternative_sample_split.parquet",
+        "FFNN2_vw": "Portfolios/FFNN2_decile_portfolios_value_weight_alternative_sample_split.parquet",
+        "FFNN3_vw": "Portfolios/FFNN3_decile_portfolios_value_weight_alternative_sample_split.parquet",
+        "FFNN4_vw": "Portfolios/FFNN4_decile_portfolios_value_weight_alternative_sample_split.parquet",
+        "FFNN5_vw": "Portfolios/FFNN5_decile_portfolios_value_weight_alternative_sample_split.parquet",
+        "Non_linear_ensemble_vw": "Portfolios/Non_linear_ensemble_decile_portfolios_value_weight_alternative_sample_split.parquet"})
 
 """## Macro co-movement
 
@@ -12263,6 +16045,11 @@ display_macro_co_movement(
         "Linear_ensemble_eq": "Portfolios/Linear_ensemble_decile_portfolios_equal_weight.parquet",
         "GBRT_eq": "Portfolios/GBRT_decile_portfolios_equal_weight.parquet",
         "RF_eq": "Portfolios/RF_decile_portfolios_equal_weight.parquet",
+        "FFNN1_eq": "Portfolios/FFNN1_decile_portfolios_equal_weight.parquet",
+        "FFNN2_eq": "Portfolios/FFNN2_decile_portfolios_equal_weight.parquet",
+        "FFNN3_eq": "Portfolios/FFNN3_decile_portfolios_equal_weight.parquet",
+        "FFNN4_eq": "Portfolios/FFNN4_decile_portfolios_equal_weight.parquet",
+        "FFNN5_eq": "Portfolios/FFNN5_decile_portfolios_equal_weight.parquet",
         "Non_linear_ensemble_eq": "Portfolios/Non_linear_ensemble_decile_portfolios_equal_weight.parquet",
 
         # Value weight
@@ -12274,6 +16061,11 @@ display_macro_co_movement(
         "Linear_ensemble_vw": "Portfolios/Linear_ensemble_decile_portfolios_value_weight.parquet",
         "GBRT_vw": "Portfolios/GBRT_decile_portfolios_value_weight.parquet",
         "RF_vw": "Portfolios/RF_decile_portfolios_value_weight.parquet",
+        "FFNN1_vw": "Portfolios/FFNN1_decile_portfolios_value_weight.parquet",
+        "FFNN2_vw": "Portfolios/FFNN2_decile_portfolios_value_weight.parquet",
+        "FFNN3_vw": "Portfolios/FFNN3_decile_portfolios_value_weight.parquet",
+        "FFNN4_vw": "Portfolios/FFNN4_decile_portfolios_value_weight.parquet",
+        "FFNN5_vw": "Portfolios/FFNN5_decile_portfolios_value_weight.parquet",
         "Non_linear_ensemble_vw": "Portfolios/Non_linear_ensemble_decile_portfolios_value_weight.parquet"})
 
 """Winsorizing"""
@@ -12289,6 +16081,11 @@ display_macro_co_movement(
         "Linear_Ensemble_eq": "Portfolios/Linear_ensemble_decile_portfolios_equal_weight_winsorized.parquet",
         "GBRT_eq": "Portfolios/GBRT_decile_portfolios_equal_weight_winsorized.parquet",
         "RF_eq": "Portfolios/RF_decile_portfolios_equal_weight_winsorized.parquet",
+        "FFNN1_eq": "Portfolios/FFNN1_decile_portfolios_equal_weight_winsorized.parquet",
+        "FFNN2_eq": "Portfolios/FFNN2_decile_portfolios_equal_weight_winsorized.parquet",
+        "FFNN3_eq": "Portfolios/FFNN3_decile_portfolios_equal_weight_winsorized.parquet",
+        "FFNN4_eq": "Portfolios/FFNN4_decile_portfolios_equal_weight_winsorized.parquet",
+        "FFNN5_eq": "Portfolios/FFNN5_decile_portfolios_equal_weight_winsorized.parquet",
         "NonLinear_Ensemble_eq": "Portfolios/Non_linear_ensemble_decile_portfolios_equal_weight_winsorized.parquet",
 
         # Value weight
@@ -12300,6 +16097,11 @@ display_macro_co_movement(
         "Linear_Ensemble_vw": "Portfolios/Linear_ensemble_decile_portfolios_value_weight_winsorized.parquet",
         "GBRT_vw": "Portfolios/GBRT_decile_portfolios_value_weight_winsorized.parquet",
         "RF_vw": "Portfolios/RF_decile_portfolios_value_weight_winsorized.parquet",
+        "FFNN1_vw": "Portfolios/FFNN1_decile_portfolios_value_weight_winsorized.parquet",
+        "FFNN2_vw": "Portfolios/FFNN2_decile_portfolios_value_weight_winsorized.parquet",
+        "FFNN3_vw": "Portfolios/FFNN3_decile_portfolios_value_weight_winsorized.parquet",
+        "FFNN4_vw": "Portfolios/FFNN4_decile_portfolios_value_weight_winsorized.parquet",
+        "FFNN5_vw": "Portfolios/FFNN5_decile_portfolios_value_weight_winsorized.parquet",
         "NonLinear_Ensemble_vw": "Portfolios/Non_linear_ensemble_decile_portfolios_value_weight_winsorized.parquet"})
 
 """Alternative data"""
@@ -12315,6 +16117,11 @@ display_macro_co_movement(
         "Linear_Ensemble_eq": "Portfolios/Linear_ensemble_decile_portfolios_equal_weight_alternative_data.parquet",
         "GBRT_eq": "Portfolios/GBRT_decile_portfolios_equal_weight_alternative_data.parquet",
         "RF_eq": "Portfolios/RF_decile_portfolios_equal_weight_alternative_data.parquet",
+        "FFNN1_eq": "Portfolios/FFNN1_decile_portfolios_equal_weight_alternative_data.parquet",
+        "FFNN2_eq": "Portfolios/FFNN2_decile_portfolios_equal_weight_alternative_data.parquet",
+        "FFNN3_eq": "Portfolios/FFNN3_decile_portfolios_equal_weight_alternative_data.parquet",
+        "FFNN4_eq": "Portfolios/FFNN4_decile_portfolios_equal_weight_alternative_data.parquet",
+        "FFNN5_eq": "Portfolios/FFNN5_decile_portfolios_equal_weight_alternative_data.parquet",
         "NonLinear_Ensemble_eq": "Portfolios/Non_linear_ensemble_decile_portfolios_equal_weight_alternative_data.parquet",
 
         # Value weight
@@ -12326,6 +16133,11 @@ display_macro_co_movement(
         "Linear_Ensemble_vw": "Portfolios/Linear_ensemble_decile_portfolios_value_weight_alternative_data.parquet",
         "GBRT_vw": "Portfolios/GBRT_decile_portfolios_value_weight_alternative_data.parquet",
         "RF_vw": "Portfolios/RF_decile_portfolios_value_weight_alternative_data.parquet",
+        "FFNN1_vw": "Portfolios/FFNN1_decile_portfolios_value_weight_alternative_data.parquet",
+        "FFNN2_vw": "Portfolios/FFNN2_decile_portfolios_value_weight_alternative_data.parquet",
+        "FFNN3_vw": "Portfolios/FFNN3_decile_portfolios_value_weight_alternative_data.parquet",
+        "FFNN4_vw": "Portfolios/FFNN4_decile_portfolios_value_weight_alternative_data.parquet",
+        "FFNN5_vw": "Portfolios/FFNN5_decile_portfolios_value_weight_alternative_data.parquet",
         "NonLinear_Ensemble_vw": "Portfolios/Non_linear_ensemble_decile_portfolios_value_weight_alternative_data.parquet"})
 
 """Top universe"""
@@ -12341,6 +16153,11 @@ display_macro_co_movement(
         "Linear_Ensemble_eq": "Portfolios/Linear_ensemble_decile_portfolios_equal_weight_top.parquet",
         "GBRT_eq": "Portfolios/GBRT_decile_portfolios_equal_weight_top.parquet",
         "RF_eq": "Portfolios/RF_decile_portfolios_equal_weight_top.parquet",
+        "FFNN1_eq": "Portfolios/FFNN1_decile_portfolios_equal_weight_top.parquet",
+        "FFNN2_eq": "Portfolios/FFNN2_decile_portfolios_equal_weight_top.parquet",
+        "FFNN3_eq": "Portfolios/FFNN3_decile_portfolios_equal_weight_top.parquet",
+        "FFNN4_eq": "Portfolios/FFNN4_decile_portfolios_equal_weight_top.parquet",
+        "FFNN5_eq": "Portfolios/FFNN5_decile_portfolios_equal_weight_top.parquet",
         "NonLinear_Ensemble_eq": "Portfolios/Non_linear_ensemble_decile_portfolios_equal_weight_top.parquet",
 
         # Value weight
@@ -12352,6 +16169,11 @@ display_macro_co_movement(
         "Linear_Ensemble_vw": "Portfolios/Linear_ensemble_decile_portfolios_value_weight_top.parquet",
         "GBRT_vw": "Portfolios/GBRT_decile_portfolios_value_weight_top.parquet",
         "RF_vw": "Portfolios/RF_decile_portfolios_value_weight_top.parquet",
+        "FFNN1_vw": "Portfolios/FFNN1_decile_portfolios_value_weight_top.parquet",
+        "FFNN2_vw": "Portfolios/FFNN2_decile_portfolios_value_weight_top.parquet",
+        "FFNN3_vw": "Portfolios/FFNN3_decile_portfolios_value_weight_top.parquet",
+        "FFNN4_vw": "Portfolios/FFNN4_decile_portfolios_value_weight_top.parquet",
+        "FFNN5_vw": "Portfolios/FFNN5_decile_portfolios_value_weight_top.parquet",
         "NonLinear_Ensemble_vw": "Portfolios/Non_linear_ensemble_decile_portfolios_value_weight_top.parquet"})
 
 """Bottom universe"""
@@ -12367,6 +16189,11 @@ display_macro_co_movement(
         "Linear_Ensemble_eq": "Portfolios/Linear_ensemble_decile_portfolios_equal_weight_bottom.parquet",
         "GBRT_eq": "Portfolios/GBRT_decile_portfolios_equal_weight_bottom.parquet",
         "RF_eq": "Portfolios/RF_decile_portfolios_equal_weight_bottom.parquet",
+        "FFNN1_eq": "Portfolios/FFNN1_decile_portfolios_equal_weight_bottom.parquet",
+        "FFNN2_eq": "Portfolios/FFNN2_decile_portfolios_equal_weight_bottom.parquet",
+        "FFNN3_eq": "Portfolios/FFNN3_decile_portfolios_equal_weight_bottom.parquet",
+        "FFNN4_eq": "Portfolios/FFNN4_decile_portfolios_equal_weight_bottom.parquet",
+        "FFNN5_eq": "Portfolios/FFNN5_decile_portfolios_equal_weight_bottom.parquet",
         "NonLinear_Ensemble_eq": "Portfolios/Non_linear_ensemble_decile_portfolios_equal_weight_bottom.parquet",
 
         # Value weight
@@ -12378,6 +16205,11 @@ display_macro_co_movement(
         "Linear_Ensemble_vw": "Portfolios/Linear_ensemble_decile_portfolios_value_weight_bottom.parquet",
         "GBRT_vw": "Portfolios/GBRT_decile_portfolios_value_weight_bottom.parquet",
         "RF_vw": "Portfolios/RF_decile_portfolios_value_weight_bottom.parquet",
+        "FFNN1_vw": "Portfolios/FFNN1_decile_portfolios_value_weight_bottom.parquet",
+        "FFNN2_vw": "Portfolios/FFNN2_decile_portfolios_value_weight_bottom.parquet",
+        "FFNN3_vw": "Portfolios/FFNN3_decile_portfolios_value_weight_bottom.parquet",
+        "FFNN4_vw": "Portfolios/FFNN4_decile_portfolios_value_weight_bottom.parquet",
+        "FFNN5_vw": "Portfolios/FFNN5_decile_portfolios_value_weight_bottom.parquet",
         "NonLinear_Ensemble_vw": "Portfolios/Non_linear_ensemble_decile_portfolios_value_weight_bottom.parquet"})
 
 """Alternative industries"""
@@ -12393,6 +16225,11 @@ display_macro_co_movement(
         "Linear_Ensemble_eq": "Portfolios/Linear_ensemble_decile_portfolios_equal_weight_alternative_industries.parquet",
         "GBRT_eq": "Portfolios/GBRT_decile_portfolios_equal_weight_alternative_industries.parquet",
         "RF_eq": "Portfolios/RF_decile_portfolios_equal_weight_alternative_industries.parquet",
+        "FFNN1_eq": "Portfolios/FFNN1_decile_portfolios_equal_weight_alternative_industries.parquet",
+        "FFNN2_eq": "Portfolios/FFNN2_decile_portfolios_equal_weight_alternative_industries.parquet",
+        "FFNN3_eq": "Portfolios/FFNN3_decile_portfolios_equal_weight_alternative_industries.parquet",
+        "FFNN4_eq": "Portfolios/FFNN4_decile_portfolios_equal_weight_alternative_industries.parquet",
+        "FFNN5_eq": "Portfolios/FFNN5_decile_portfolios_equal_weight_alternative_industries.parquet",
         "NonLinear_Ensemble_eq": "Portfolios/Non_linear_ensemble_decile_portfolios_equal_weight_alternative_industries.parquet",
 
         # Value weight
@@ -12404,6 +16241,11 @@ display_macro_co_movement(
         "Linear_Ensemble_vw": "Portfolios/Linear_ensemble_decile_portfolios_value_weight_alternative_industries.parquet",
         "GBRT_vw": "Portfolios/GBRT_decile_portfolios_value_weight_alternative_industries.parquet",
         "RF_vw": "Portfolios/RF_decile_portfolios_value_weight_alternative_industries.parquet",
+        "FFNN1_vw": "Portfolios/FFNN1_decile_portfolios_value_weight_alternative_industries.parquet",
+        "FFNN2_vw": "Portfolios/FFNN2_decile_portfolios_value_weight_alternative_industries.parquet",
+        "FFNN3_vw": "Portfolios/FFNN3_decile_portfolios_value_weight_alternative_industries.parquet",
+        "FFNN4_vw": "Portfolios/FFNN4_decile_portfolios_value_weight_alternative_industries.parquet",
+        "FFNN5_vw": "Portfolios/FFNN5_decile_portfolios_value_weight_alternative_industries.parquet",
         "NonLinear_Ensemble_vw": "Portfolios/Non_linear_ensemble_decile_portfolios_value_weight_alternative_industries.parquet"})
 
 """Alternative sample split"""
@@ -12419,6 +16261,11 @@ display_macro_co_movement(
         "Linear_Ensemble_eq": "Portfolios/Linear_ensemble_decile_portfolios_equal_weight_alternative_sample_split.parquet",
         "GBRT_eq": "Portfolios/GBRT_decile_portfolios_equal_weight_alternative_sample_split.parquet",
         "RF_eq": "Portfolios/RF_decile_portfolios_equal_weight_alternative_sample_split.parquet",
+        "FFNN1_eq": "Portfolios/FFNN1_decile_portfolios_equal_weight_alternative_sample_split.parquet",
+        "FFNN2_eq": "Portfolios/FFNN2_decile_portfolios_equal_weight_alternative_sample_split.parquet",
+        "FFNN3_eq": "Portfolios/FFNN3_decile_portfolios_equal_weight_alternative_sample_split.parquet",
+        "FFNN4_eq": "Portfolios/FFNN4_decile_portfolios_equal_weight_alternative_sample_split.parquet",
+        "FFNN5_eq": "Portfolios/FFNN5_decile_portfolios_equal_weight_alternative_sample_split.parquet",
         "NonLinear_Ensemble_eq": "Portfolios/Non_linear_ensemble_decile_portfolios_equal_weight_alternative_sample_split.parquet",
 
         # Value weight
@@ -12430,6 +16277,11 @@ display_macro_co_movement(
         "Linear_Ensemble_vw": "Portfolios/Linear_ensemble_decile_portfolios_value_weight_alternative_sample_split.parquet",
         "GBRT_vw": "Portfolios/GBRT_decile_portfolios_value_weight_alternative_sample_split.parquet",
         "RF_vw": "Portfolios/RF_decile_portfolios_value_weight_alternative_sample_split.parquet",
+        "FFNN1_vw": "Portfolios/FFNN1_decile_portfolios_value_weight_alternative_sample_split.parquet",
+        "FFNN2_vw": "Portfolios/FFNN2_decile_portfolios_value_weight_alternative_sample_split.parquet",
+        "FFNN3_vw": "Portfolios/FFNN3_decile_portfolios_value_weight_alternative_sample_split.parquet",
+        "FFNN4_vw": "Portfolios/FFNN4_decile_portfolios_value_weight_alternative_sample_split.parquet",
+        "FFNN5_vw": "Portfolios/FFNN5_decile_portfolios_value_weight_alternative_sample_split.parquet",
         "NonLinear_Ensemble_vw": "Portfolios/Non_linear_ensemble_decile_portfolios_value_weight_alternative_sample_split.parquet"})
 
 """# Figures
@@ -12447,8 +16299,13 @@ fig, ax_components, ax_features, complexity_data = create_model_complexity_graph
     feature_files={
         "OLS": "Model output/OLS_number_of_features.parquet",
         "GBRT": "Model output/GBRT_number_of_features.parquet",
-        "RF": "Model output/RF_number_of_features.parquet"},
-    title="Model Complexity: Standard Sample")
+        "RF": "Model output/RF_number_of_features.parquet",
+        "FFNN1": "Model output/FFNN1_number_of_features.parquet",
+        "FFNN2": "Model output/FFNN2_number_of_features.parquet",
+        "FFNN3": "Model output/FFNN3_number_of_features.parquet",
+        "FFNN4": "Model output/FFNN4_number_of_features.parquet",
+        "FFNN5": "Model output/FFNN5_number_of_features.parquet"},
+    title="Standard Sample Model Complexity")
 
 """Winsorizing"""
 
@@ -12460,8 +16317,13 @@ fig, ax_components, ax_features, complexity_data = create_model_complexity_graph
     feature_files={
         "OLS": "Model output winsorized/OLS_number_of_features_winsorized.parquet",
         "GBRT": "Model output winsorized/GBRT_number_of_features_winsorized.parquet",
-        "RF": "Model output winsorized/RF_number_of_features_winsorized.parquet"},
-    title="Model Complexity: Winsorized Sample")
+        "RF": "Model output winsorized/RF_number_of_features_winsorized.parquet",
+        "FFNN1": "Model output winsorized/FFNN1_number_of_features_winsorized.parquet",
+        "FFNN2": "Model output winsorized/FFNN2_number_of_features_winsorized.parquet",
+        "FFNN3": "Model output winsorized/FFNN3_number_of_features_winsorized.parquet",
+        "FFNN4": "Model output winsorized/FFNN4_number_of_features_winsorized.parquet",
+        "FFNN5": "Model output winsorized/FFNN5_number_of_features_winsorized.parquet"},
+    title="Winsorized Sample Model Complexity")
 
 """Alternative data"""
 
@@ -12473,8 +16335,13 @@ fig, ax_components, ax_features, complexity_data = create_model_complexity_graph
     feature_files={
         "OLS": "Model output alternative data/OLS_number_of_features_alternative_data.parquet",
         "GBRT": "Model output alternative data/GBRT_number_of_features_alternative_data.parquet",
-        "RF": "Model output alternative data/RF_number_of_features_alternative_data.parquet"},
-    title="Model Complexity: Alternative Data Sample")
+        "RF": "Model output alternative data/RF_number_of_features_alternative_data.parquet",
+        "FFNN1": "Model output alternative data/FFNN1_number_of_features_alternative_data.parquet",
+        "FFNN2": "Model output alternative data/FFNN2_number_of_features_alternative_data.parquet",
+        "FFNN3": "Model output alternative data/FFNN3_number_of_features_alternative_data.parquet",
+        "FFNN4": "Model output alternative data/FFNN4_number_of_features_alternative_data.parquet",
+        "FFNN5": "Model output alternative data/FFNN5_number_of_features_alternative_data.parquet"},
+    title="Alternative Data Sample Model Complexity")
 
 """Top universe"""
 
@@ -12486,8 +16353,13 @@ fig, ax_components, ax_features, complexity_data = create_model_complexity_graph
     feature_files={
         "OLS": "Model output top/OLS_number_of_features_top.parquet",
         "GBRT": "Model output top/GBRT_number_of_features_top.parquet",
-        "RF": "Model output top/RF_number_of_features_top.parquet"},
-    title="Model Complexity: Top Sample")
+        "RF": "Model output top/RF_number_of_features_top.parquet",
+        "FFNN1": "Model output top/FFNN1_number_of_features_top.parquet",
+        "FFNN2": "Model output top/FFNN2_number_of_features_top.parquet",
+        "FFNN3": "Model output top/FFNN3_number_of_features_top.parquet",
+        "FFNN4": "Model output top/FFNN4_number_of_features_top.parquet",
+        "FFNN5": "Model output top/FFNN5_number_of_features_top.parquet"},
+    title="Top Sample Model Complexity")
 
 """Bottom universe"""
 
@@ -12499,8 +16371,13 @@ fig, ax_components, ax_features, complexity_data = create_model_complexity_graph
     feature_files={
         "OLS": "Model output bottom/OLS_number_of_features_bottom.parquet",
         "GBRT": "Model output bottom/GBRT_number_of_features_bottom.parquet",
-        "RF": "Model output bottom/RF_number_of_features_bottom.parquet"},
-    title="Model Complexity: Bottom Sample")
+        "RF": "Model output bottom/RF_number_of_features_bottom.parquet",
+        "FFNN1": "Model output bottom/FFNN1_number_of_features_bottom.parquet",
+        "FFNN2": "Model output bottom/FFNN2_number_of_features_bottom.parquet",
+        "FFNN3": "Model output bottom/FFNN3_number_of_features_bottom.parquet",
+        "FFNN4": "Model output bottom/FFNN4_number_of_features_bottom.parquet",
+        "FFNN5": "Model output bottom/FFNN5_number_of_features_bottom.parquet"},
+    title="Bottom Sample Model Complexity")
 
 """Alternative industries"""
 
@@ -12512,8 +16389,13 @@ fig, ax_components, ax_features, complexity_data = create_model_complexity_graph
     feature_files={
         "OLS": "Model output alternative industries/OLS_number_of_features_alternative_industries.parquet",
         "GBRT": "Model output alternative industries/GBRT_number_of_features_alternative_industries.parquet",
-        "RF": "Model output alternative industries/RF_number_of_features_alternative_industries.parquet"},
-    title="Model Complexity: Alternative Industries Sample")
+        "RF": "Model output alternative industries/RF_number_of_features_alternative_industries.parquet",
+        "FFNN1": "Model output alternative industries/FFNN1_number_of_features_alternative_industries.parquet",
+        "FFNN2": "Model output alternative industries/FFNN2_number_of_features_alternative_industries.parquet",
+        "FFNN3": "Model output alternative industries/FFNN3_number_of_features_alternative_industries.parquet",
+        "FFNN4": "Model output alternative industries/FFNN4_number_of_features_alternative_industries.parquet",
+        "FFNN5": "Model output alternative industries/FFNN5_number_of_features_alternative_industries.parquet"},
+    title="Alternative Industries Sample Model Complexity")
 
 """Alternative sample split"""
 
@@ -12525,8 +16407,13 @@ fig, ax_components, ax_features, complexity_data = create_model_complexity_graph
     feature_files={
         "OLS": "Model output alternative sample split/OLS_number_of_features_alternative_sample_split.parquet",
         "GBRT": "Model output alternative sample split/GBRT_number_of_features_alternative_sample_split.parquet",
-        "RF": "Model output alternative sample split/RF_number_of_features_alternative_sample_split.parquet"},
-    title="Model Complexity: Alternative Sample Split Sample")
+        "RF": "Model output alternative sample split/RF_number_of_features_alternative_sample_split.parquet",
+        "FFNN1": "Model output alternative sample split/FFNN1_number_of_features_alternative_sample_split.parquet",
+        "FFNN2": "Model output alternative sample split/FFNN2_number_of_features_alternative_sample_split.parquet",
+        "FFNN3": "Model output alternative sample split/FFNN3_number_of_features_alternative_sample_split.parquet",
+        "FFNN4": "Model output alternative sample split/FFNN4_number_of_features_alternative_sample_split.parquet",
+        "FFNN5": "Model output alternative sample split/FFNN5_number_of_features_alternative_sample_split.parquet"},
+    title="Alternative Sample Split Sample Model Complexity")
 
 """## Variable importance
 
@@ -12539,7 +16426,12 @@ top_variable_importance, family_importance = create_variable_importance_graphs({
     "IPCA": "Model output/IPCA_variable_importance_average.parquet",
     "PLS": "Model output/PLS_variable_importance_average.parquet",
     "GBRT": "Model output/GBRT_variable_importance_average.parquet",
-    "RF": "Model output/RF_variable_importance_average.parquet"})
+    "RF": "Model output/RF_variable_importance_average.parquet",
+    "FFNN1" : "Model output/FFNN1_variable_importance_average.parquet",
+    "FFNN2" : "Model output/FFNN2_variable_importance_average.parquet",
+    "FFNN3" : "Model output/FFNN3_variable_importance_average.parquet",
+    "FFNN4" : "Model output/FFNN4_variable_importance_average.parquet",
+    "FFNN5" : "Model output/FFNN5_variable_importance_average.parquet"})
 
 """Winsorizing"""
 
@@ -12549,7 +16441,12 @@ top_variable_importance, family_importance = create_variable_importance_graphs({
     "IPCA": "Model output winsorized/IPCA_variable_importance_average_winsorized.parquet",
     "PLS": "Model output winsorized/PLS_variable_importance_average_winsorized.parquet",
     "GBRT": "Model output winsorizedGBRT_variable_importance_average_winsorized.parquet",
-    "RF": "Model output winsorized/RF_variable_importance_average_winsorized.parquet"})
+    "RF": "Model output winsorized/RF_variable_importance_average_winsorized.parquet",
+    "FFNN1" : "Model output winsorized/FFNN1_variable_importance_average_winsorized.parquet",
+    "FFNN2" : "Model output winsorized/FFNN2_variable_importance_average_winsorized.parquet",
+    "FFNN3" : "Model output winsorized/FFNN3_variable_importance_average_winsorized.parquet",
+    "FFNN4" : "Model output winsorized/FFNN4_variable_importance_average_winsorized.parquet",
+    "FFNN5" : "Model output winsorized/FFNN5_variable_importance_average_winsorized.parquet"})
 
 """Alternative data"""
 
@@ -12559,7 +16456,12 @@ top_variable_importance, family_importance = create_variable_importance_graphs({
     "IPCA": "Model output alternative data/IPCA_variable_importance_average_alternative_data.parquet",
     "PLS": "Model output alternative data/PLS_variable_importance_average_alternative_data.parquet",
     "GBRT": "Model output alternative data/GBRT_variable_importance_average_alternative_data.parquet",
-    "RF": "Model output alternative data/RF_variable_importance_average_alternative_data.parquet"})
+    "RF": "Model output alternative data/RF_variable_importance_average_alternative_data.parquet",
+    "FFNN1" : "Model output alternative data/FFNN1_variable_importance_average_alternative_data.parquet",
+    "FFNN2" : "Model output alternative data/FFNN2_variable_importance_average_alternative_data.parquet",
+    "FFNN3" : "Model output alternative data/FFNN3_variable_importance_average_alternative_data.parquet",
+    "FFNN4" : "Model output alternative data/FFNN4_variable_importance_average_alternative_data.parquet",
+    "FFNN5" : "Model output alternative data/FFNN5_variable_importance_average_alternative_data.parquet"})
 
 """Top universe"""
 
@@ -12569,7 +16471,12 @@ top_variable_importance, family_importance = create_variable_importance_graphs({
     "IPCA": "Model output top/IPCA_variable_importance_average_top.parquet",
     "PLS": "Model output top/PLS_variable_importance_average_top.parquet",
     "GBRT": "Model output top/GBRT_variable_importance_average_top.parquet",
-    "RF": "Model output top/RF_variable_importance_average_top.parquet"})
+    "RF": "Model output top/RF_variable_importance_average_top.parquet",
+    "FFNN1" : "Model output top/FFNN1_variable_importance_average_top.parquet",
+    "FFNN2" : "Model output top/FFNN2_variable_importance_average_top.parquet",
+    "FFNN3" : "Model output top/FFNN3_variable_importance_average_top.parquet",
+    "FFNN4" : "Model output top/FFNN4_variable_importance_average_top.parquet",
+    "FFNN5" : "Model output top/FFNN5_variable_importance_average_top.parquet"})
 
 """Bottom universe"""
 
@@ -12579,7 +16486,12 @@ top_variable_importance, family_importance = create_variable_importance_graphs({
     "IPCA": "Model output bottom/IPCA_variable_importance_average_bottom.parquet",
     "PLS": "Model output bottom/PLS_variable_importance_average_bottom.parquet",
     "GBRT": "Model output bottom/GBRT_variable_importance_average_bottom.parquet",
-    "RF": "Model output bottom/RF_variable_importance_average_bottom.parquet"})
+    "RF": "Model output bottom/RF_variable_importance_average_bottom.parquet",
+    "FFNN1" : "Model output bottom/FFNN1_variable_importance_average_bottom.parquet",
+    "FFNN2" : "Model output bottom/FFNN2_variable_importance_average_bottom.parquet",
+    "FFNN3" : "Model output bottom/FFNN3_variable_importance_average_bottom.parquet",
+    "FFNN4" : "Model output bottom/FFNN4_variable_importance_average_bottom.parquet",
+    "FFNN5" : "Model output bottom/FFNN5_variable_importance_average_bottom.parquet"})
 
 """Alternative industries"""
 
@@ -12589,7 +16501,12 @@ top_variable_importance, family_importance = create_variable_importance_graphs({
     "IPCA": "Model output alternative industries/IPCA_variable_importance_average_alternative_industries.parquet",
     "PLS": "Model output alternative industries/PLS_variable_importance_average_alternative_industries.parquet",
     "GBRT": "Model output alternative industries/GBRT_variable_importance_average_alternative_industries.parquet",
-    "RF": "Model output alternative industries/RF_variable_importance_average_alternative_industries.parquet"})
+    "RF": "Model output alternative industries/RF_variable_importance_average_alternative_industries.parquet",
+    "FFNN1" : "Model output alternative industries/FFNN1_variable_importance_average_alternative_industries.parquet",
+    "FFNN2" : "Model output alternative industries/FFNN2_variable_importance_average_alternative_industries.parquet",
+    "FFNN3" : "Model output alternative industries/FFNN3_variable_importance_average_alternative_industries.parquet",
+    "FFNN4" : "Model output alternative industries/FFNN4_variable_importance_average_alternative_industries.parquet",
+    "FFNN5" : "Model output alternative industries/FFNN5_variable_importance_average_alternative_industries.parquet"})
 
 """Alternative sample split"""
 
@@ -12599,7 +16516,12 @@ top_variable_importance, family_importance = create_variable_importance_graphs({
     "IPCA": "Model output alternative sample split/IPCA_variable_importance_average_alternative_sample_split.parquet",
     "PLS": "Model output alternative sample split/PLS_variable_importance_average_alternative_sample_split.parquet",
     "GBRT": "Model output alternative sample split/GBRT_variable_importance_average_alternative_sample_split.parquet",
-    "RF": "Model output alternative sample split/RF_variable_importance_average_alternative_sample_split.parquet"})
+    "RF": "Model output alternative sample split/RF_variable_importance_average_alternative_sample_split.parquet",
+    "FFNN1" : "Model output alternative sample split/FFNN1_variable_importance_average_alternative_sample_split.parquet",
+    "FFNN2" : "Model output alternative sample split/FFNN2_variable_importance_average_alternative_sample_split.parquet",
+    "FFNN3" : "Model output alternative sample split/FFNN3_variable_importance_average_alternative_sample_split.parquet",
+    "FFNN4" : "Model output alternative sample split/FFNN4_variable_importance_average_alternative_sample_split.parquet",
+    "FFNN5" : "Model output alternative sample split/FFNN5_variable_importance_average_alternative_sample_split.parquet"})
 
 """## Time-varying variable importance
 
@@ -12612,7 +16534,12 @@ time_varying_family_importance = create_time_varying_family_importance_graphs({
     "IPCA": "Model output/IPCA_variable_importance_time_varying.parquet",
     "PLS": "Model output/PLS_variable_importance_time_varying.parquet",
     "GBRT": "Model output/GBRT_variable_importance_time_varying.parquet",
-    "RF": "Model output/RF_variable_importance_time_varying.parquet"})
+    "RF": "Model output/RF_variable_importance_time_varying.parquet",
+    "FFNN1" : "Model output/FFNN1_variable_importance_time_varying.parquet",
+    "FFNN2" : "Model output/FFNN2_variable_importance_time_varying.parquet",
+    "FFNN3" : "Model output/FFNN3_variable_importance_time_varying.parquet",
+    "FFNN4" : "Model output/FFNN4_variable_importance_time_varying.parquet",
+    "FFNN5" : "Model output/FFNN5_variable_importance_time_varying.parquet"})
 
 """Winsorizing"""
 
@@ -12622,7 +16549,12 @@ time_varying_family_importance = create_time_varying_family_importance_graphs({
     "IPCA": "Model output winsorized/IPCA_variable_importance_average_winsorized.parquet",
     "PLS": "Model output winsorized/PLS_variable_importance_average_winsorized.parquet",
     "GBRT": "Model output winsorizedGBRT_variable_importance_average_winsorized.parquet",
-    "RF": "Model output winsorized/RF_variable_importance_average_winsorized.parquet"})
+    "RF": "Model output winsorized/RF_variable_importance_average_winsorized.parquet",
+    "FFNN1" : "Model output winsorized/FFNN1_variable_importance_average_winsorized.parquet",
+    "FFNN2" : "Model output winsorized/FFNN2_variable_importance_average_winsorized.parquet",
+    "FFNN3" : "Model output winsorized/FFNN3_variable_importance_average_winsorized.parquet",
+    "FFNN4" : "Model output winsorized/FFNN4_variable_importance_average_winsorized.parquet",
+    "FFNN5" : "Model output winsorized/FFNN5_variable_importance_average_winsorized.parquet"})
 
 """Alternative data"""
 
@@ -12632,7 +16564,12 @@ time_varying_family_importance = create_time_varying_family_importance_graphs({
     "IPCA": "Model output alternative data/IPCA_variable_importance_average_alternative_data.parquet",
     "PLS": "Model output alternative data/PLS_variable_importance_average_alternative_data.parquet",
     "GBRT": "Model output alternative data/GBRT_variable_importance_average_alternative_data.parquet",
-    "RF": "Model output alternative data/RF_variable_importance_average_alternative_data.parquet"})
+    "RF": "Model output alternative data/RF_variable_importance_average_alternative_data.parquet",
+    "FFNN1" : "Model output alternative data/FFNN1_variable_importance_average_alternative_data.parquet",
+    "FFNN2" : "Model output alternative data/FFNN2_variable_importance_average_alternative_data.parquet",
+    "FFNN3" : "Model output alternative data/FFNN3_variable_importance_average_alternative_data.parquet",
+    "FFNN4" : "Model output alternative data/FFNN4_variable_importance_average_alternative_data.parquet",
+    "FFNN5" : "Model output alternative data/FFNN5_variable_importance_average_alternative_data.parquet"})
 
 """Top universe"""
 
@@ -12642,7 +16579,12 @@ time_varying_family_importance = create_time_varying_family_importance_graphs({
     "IPCA": "Model output top/IPCA_variable_importance_average_top.parquet",
     "PLS": "Model output top/PLS_variable_importance_average_top.parquet",
     "GBRT": "Model output top/GBRT_variable_importance_average_top.parquet",
-    "RF": "Model output top/RF_variable_importance_average_top.parquet"})
+    "RF": "Model output top/RF_variable_importance_average_top.parquet",
+    "FFNN1" : "Model output top/FFNN1_variable_importance_average_top.parquet",
+    "FFNN2" : "Model output top/FFNN2_variable_importance_average_top.parquet",
+    "FFNN3" : "Model output top/FFNN3_variable_importance_average_top.parquet",
+    "FFNN4" : "Model output top/FFNN4_variable_importance_average_top.parquet",
+    "FFNN5" : "Model output top/FFNN5_variable_importance_average_top.parquet"})
 
 """Bottom universe"""
 
@@ -12652,7 +16594,12 @@ time_varying_family_importance = create_time_varying_family_importance_graphs({
     "IPCA": "Model output bottom/IPCA_variable_importance_average_bottom.parquet",
     "PLS": "Model output bottom/PLS_variable_importance_average_bottom.parquet",
     "GBRT": "Model output bottom/GBRT_variable_importance_average_bottom.parquet",
-    "RF": "Model output bottom/RF_variable_importance_average_bottom.parquet"})
+    "RF": "Model output bottom/RF_variable_importance_average_bottom.parquet",
+    "FFNN1" : "Model output bottom/FFNN1_variable_importance_average_bottom.parquet",
+    "FFNN2" : "Model output bottom/FFNN2_variable_importance_average_bottom.parquet",
+    "FFNN3" : "Model output bottom/FFNN3_variable_importance_average_bottom.parquet",
+    "FFNN4" : "Model output bottom/FFNN4_variable_importance_average_bottom.parquet",
+    "FFNN5" : "Model output bottom/FFNN5_variable_importance_average_bottom.parquet"})
 
 """Alternative industries"""
 
@@ -12662,7 +16609,12 @@ time_varying_family_importance = create_time_varying_family_importance_graphs({
     "IPCA": "Model output alternative industries/IPCA_variable_importance_average_alternative_industries.parquet",
     "PLS": "Model output alternative industries/PLS_variable_importance_average_alternative_industries.parquet",
     "GBRT": "Model output alternative industries/GBRT_variable_importance_average_alternative_industries.parquet",
-    "RF": "Model output alternative industries/RF_variable_importance_average_alternative_industries.parquet"})
+    "RF": "Model output alternative industries/RF_variable_importance_average_alternative_industries.parquet",
+    "FFNN1" : "Model output alternative industries/FFNN1_variable_importance_average_alternative_industries.parquet",
+    "FFNN2" : "Model output alternative industries/FFNN2_variable_importance_average_alternative_industries.parquet",
+    "FFNN3" : "Model output alternative industries/FFNN3_variable_importance_average_alternative_industries.parquet",
+    "FFNN4" : "Model output alternative industries/FFNN4_variable_importance_average_alternative_industries.parquet",
+    "FFNN5" : "Model output alternative industries/FFNN5_variable_importance_average_alternative_industries.parquet"})
 
 """Alternative sample split"""
 
@@ -12672,7 +16624,12 @@ time_varying_family_importance = create_time_varying_family_importance_graphs({
     "IPCA": "Model output alternative sample split/IPCA_variable_importance_average_alternative_sample_split.parquet",
     "PLS": "Model output alternative sample split/PLS_variable_importance_average_alternative_sample_split.parquet",
     "GBRT": "Model output alternative sample split/GBRT_variable_importance_average_alternative_sample_split.parquet",
-    "RF": "Model output alternative sample split/RF_variable_importance_average_alternative_sample_split.parquet"})
+    "RF": "Model output alternative sample split/RF_variable_importance_average_alternative_sample_split.parquet",
+    "FFNN1" : "Model output alternative sample split/FFNN1_variable_importance_average_alternative_sample_split.parquet",
+    "FFNN2" : "Model output alternative sample split/FFNN2_variable_importance_average_alternative_sample_split.parquet",
+    "FFNN3" : "Model output alternative sample split/FFNN3_variable_importance_average_alternative_sample_split.parquet",
+    "FFNN4" : "Model output alternative sample split/FFNN4_variable_importance_average_alternative_sample_split.parquet",
+    "FFNN5" : "Model output alternative sample split/FFNN5_variable_importance_average_alternative_sample_split.parquet"})
 
 """## Extended variable importance
 
@@ -12686,7 +16643,12 @@ fig, ax, relative_rank_matrix, expanded_matrix = create_extended_variable_import
         "IPCA": "Model output/IPCA_variable_importance_average.parquet",
         "PLS": "Model output/PLS_variable_importance_average.parquet",
         "GBRT": "Model output/GBRT_variable_importance_average.parquet",
-        "RF": "Model output/RF_variable_importance_average.parquet"})
+        "RF": "Model output/RF_variable_importance_average.parquet",
+        "FFNN1" : "Model output/FFNN1_variable_importance_average.parquet",
+        "FFNN2" : "Model output/FFNN2_variable_importance_average.parquet",
+        "FFNN3" : "Model output/FFNN3_variable_importance_average.parquet",
+        "FFNN4" : "Model output/FFNN4_variable_importance_average.parquet",
+        "FFNN5" : "Model output/FFNN5_variable_importance_average.parquet"})
 
 """Winsorizing"""
 
@@ -12697,7 +16659,12 @@ fig, ax, relative_rank_matrix, expanded_matrix = create_extended_variable_import
         "IPCA": "Model output winsorized/IPCA_variable_importance_average_winsorized.parquet",
         "PLS": "Model output winsorized/PLS_variable_importance_average_winsorized.parquet",
         "GBRT": "Model output winsorizedGBRT_variable_importance_average_winsorized.parquet",
-        "RF": "Model output winsorized/RF_variable_importance_average_winsorized.parquet"})
+        "RF": "Model output winsorized/RF_variable_importance_average_winsorized.parquet",
+        "FFNN1" : "Model output winsorized/FFNN1_variable_importance_average_winsorized.parquet",
+        "FFNN2" : "Model output winsorized/FFNN2_variable_importance_average_winsorized.parquet",
+        "FFNN3" : "Model output winsorized/FFNN3_variable_importance_average_winsorized.parquet",
+        "FFNN4" : "Model output winsorized/FFNN4_variable_importance_average_winsorized.parquet",
+        "FFNN5" : "Model output winsorized/FFNN5_variable_importance_average_winsorized.parquet"})
 
 """Alternative data"""
 
@@ -12708,7 +16675,12 @@ fig, ax, relative_rank_matrix, expanded_matrix = create_extended_variable_import
         "IPCA": "Model output alternative data/IPCA_variable_importance_average_alternative_data.parquet",
         "PLS": "Model output alternative data/PLS_variable_importance_average_alternative_data.parquet",
         "GBRT": "Model output alternative data/GBRT_variable_importance_average_alternative_data.parquet",
-        "RF": "Model output alternative data/RF_variable_importance_average_alternative_data.parquet"})
+        "RF": "Model output alternative data/RF_variable_importance_average_alternative_data.parquet",
+        "FFNN1" : "Model output alternative data/FFNN1_variable_importance_average_alternative_data.parquet",
+        "FFNN2" : "Model output alternative data/FFNN2_variable_importance_average_alternative_data.parquet",
+        "FFNN3" : "Model output alternative data/FFNN3_variable_importance_average_alternative_data.parquet",
+        "FFNN4" : "Model output alternative data/FFNN4_variable_importance_average_alternative_data.parquet",
+        "FFNN5" : "Model output alternative data/FFNN5_variable_importance_average_alternative_data.parquet"})
 
 """Top universe"""
 
@@ -12719,7 +16691,12 @@ fig, ax, relative_rank_matrix, expanded_matrix = create_extended_variable_import
         "IPCA": "Model output top/IPCA_variable_importance_average_top.parquet",
         "PLS": "Model output top/PLS_variable_importance_average_top.parquet",
         "GBRT": "Model output top/GBRT_variable_importance_average_top.parquet",
-        "RF": "Model output top/RF_variable_importance_average_top.parquet"})
+        "RF": "Model output top/RF_variable_importance_average_top.parquet",
+        "FFNN1" : "Model output top/FFNN1_variable_importance_average_top.parquet",
+        "FFNN2" : "Model output top/FFNN2_variable_importance_average_top.parquet",
+        "FFNN3" : "Model output top/FFNN3_variable_importance_average_top.parquet",
+        "FFNN4" : "Model output top/FFNN4_variable_importance_average_top.parquet",
+        "FFNN5" : "Model output top/FFNN5_variable_importance_average_top.parquet"})
 
 """Bottom universe"""
 
@@ -12730,7 +16707,12 @@ fig, ax, relative_rank_matrix, expanded_matrix = create_extended_variable_import
         "IPCA": "Model output bottom/IPCA_variable_importance_average_bottom.parquet",
         "PLS": "Model output bottom/PLS_variable_importance_average_bottom.parquet",
         "GBRT": "Model output bottom/GBRT_variable_importance_average_bottom.parquet",
-        "RF": "Model output bottom/RF_variable_importance_average_bottom.parquet"})
+        "RF": "Model output bottom/RF_variable_importance_average_bottom.parquet",
+        "FFNN1" : "Model output bottom/FFNN1_variable_importance_average_bottom.parquet",
+        "FFNN2" : "Model output bottom/FFNN2_variable_importance_average_bottom.parquet",
+        "FFNN3" : "Model output bottom/FFNN3_variable_importance_average_bottom.parquet",
+        "FFNN4" : "Model output bottom/FFNN4_variable_importance_average_bottom.parquet",
+        "FFNN5" : "Model output bottom/FFNN5_variable_importance_average_bottom.parquet"})
 
 """Alternative industries"""
 
@@ -12741,7 +16723,12 @@ fig, ax, relative_rank_matrix, expanded_matrix = create_extended_variable_import
         "IPCA": "Model output alternative industries/IPCA_variable_importance_average_alternative_industries.parquet",
         "PLS": "Model output alternative industries/PLS_variable_importance_average_alternative_industries.parquet",
         "GBRT": "Model output alternative industries/GBRT_variable_importance_average_alternative_industries.parquet",
-        "RF": "Model output alternative industries/RF_variable_importance_average_alternative_industries.parquet"})
+        "RF": "Model output alternative industries/RF_variable_importance_average_alternative_industries.parquet",
+        "FFNN1" : "Model output alternative industries/FFNN1_variable_importance_average_alternative_industries.parquet",
+        "FFNN2" : "Model output alternative industries/FFNN2_variable_importance_average_alternative_industries.parquet",
+        "FFNN3" : "Model output alternative industries/FFNN3_variable_importance_average_alternative_industries.parquet",
+        "FFNN4" : "Model output alternative industries/FFNN4_variable_importance_average_alternative_industries.parquet",
+        "FFNN5" : "Model output alternative industries/FFNN5_variable_importance_average_alternative_industries.parquet"})
 
 """Alternative sample split"""
 
@@ -12752,7 +16739,12 @@ fig, ax, relative_rank_matrix, expanded_matrix = create_extended_variable_import
         "IPCA": "Model output alternative sample split/IPCA_variable_importance_average_alternative_sample_split.parquet",
         "PLS": "Model output alternative sample split/PLS_variable_importance_average_alternative_sample_split.parquet",
         "GBRT": "Model output alternative sample split/GBRT_variable_importance_average_alternative_sample_split.parquet",
-        "RF": "Model output alternative sample split/RF_variable_importance_average_alternative_sample_split.parquet"})
+        "RF": "Model output alternative sample split/RF_variable_importance_average_alternative_sample_split.parquet",
+        "FFNN1" : "Model output alternative sample split/FFNN1_variable_importance_average_alternative_sample_split.parquet",
+        "FFNN2" : "Model output alternative sample split/FFNN2_variable_importance_average_alternative_sample_split.parquet",
+        "FFNN3" : "Model output alternative sample split/FFNN3_variable_importance_average_alternative_sample_split.parquet",
+        "FFNN4" : "Model output alternative sample split/FFNN4_variable_importance_average_alternative_sample_split.parquet",
+        "FFNN5" : "Model output alternative sample split/FFNN5_variable_importance_average_alternative_sample_split.parquet"})
 
 """## Portfolio performance
 
@@ -12770,6 +16762,11 @@ display_portfolio_performance_graphs(
         "Linear_ensemble_eq": "Portfolios/Linear_ensemble_decile_portfolios_equal_weight.parquet",
         "GBRT_eq": "Portfolios/GBRT_decile_portfolios_equal_weight.parquet",
         "RF_eq": "Portfolios/RF_decile_portfolios_equal_weight.parquet",
+        "FFNN1_eq": "Portfolios/FFNN1_decile_portfolios_equal_weight.parquet",
+        "FFNN2_eq": "Portfolios/FFNN2_decile_portfolios_equal_weight.parquet",
+        "FFNN3_eq": "Portfolios/FFNN3_decile_portfolios_equal_weight.parquet",
+        "FFNN4_eq": "Portfolios/FFNN4_decile_portfolios_equal_weight.parquet",
+        "FFNN5_eq": "Portfolios/FFNN5_decile_portfolios_equal_weight.parquet",
         "Non_linear_ensemble_eq": "Portfolios/Non_linear_ensemble_decile_portfolios_equal_weight.parquet",
 
         # Value weight
@@ -12781,6 +16778,11 @@ display_portfolio_performance_graphs(
         "Linear_ensemble_vw": "Portfolios/Linear_ensemble_decile_portfolios_value_weight.parquet",
         "GBRT_vw": "Portfolios/GBRT_decile_portfolios_value_weight.parquet",
         "RF_vw": "Portfolios/RF_decile_portfolios_value_weight.parquet",
+        "FFNN1_vw": "Portfolios/FFNN1_decile_portfolios_value_weight.parquet",
+        "FFNN2_vw": "Portfolios/FFNN2_decile_portfolios_value_weight.parquet",
+        "FFNN3_vw": "Portfolios/FFNN3_decile_portfolios_value_weight.parquet",
+        "FFNN4_vw": "Portfolios/FFNN4_decile_portfolios_value_weight.parquet",
+        "FFNN5_vw": "Portfolios/FFNN5_decile_portfolios_value_weight.parquet",
         "Non_linear_ensemble_vw": "Portfolios/Non_linear_ensemble_decile_portfolios_value_weight.parquet"})
 
 """Winsorizing"""
@@ -12796,6 +16798,11 @@ display_portfolio_performance_graphs(
         "Linear_Ensemble_eq": "Portfolios/Linear_ensemble_decile_portfolios_equal_weight_winsorized.parquet",
         "GBRT_eq": "Portfolios/GBRT_decile_portfolios_equal_weight_winsorized.parquet",
         "RF_eq": "Portfolios/RF_decile_portfolios_equal_weight_winsorized.parquet",
+        "FFNN1_eq": "Portfolios/FFNN1_decile_portfolios_equal_weight_winsorized.parquet",
+        "FFNN2_eq": "Portfolios/FFNN2_decile_portfolios_equal_weight_winsorized.parquet",
+        "FFNN3_eq": "Portfolios/FFNN3_decile_portfolios_equal_weight_winsorized.parquet",
+        "FFNN4_eq": "Portfolios/FFNN4_decile_portfolios_equal_weight_winsorized.parquet",
+        "FFNN5_eq": "Portfolios/FFNN5_decile_portfolios_equal_weight_winsorized.parquet",
         "NonLinear_Ensemble_eq": "Portfolios/Non_linear_ensemble_decile_portfolios_equal_weight_winsorized.parquet",
 
         # Value weight
@@ -12807,6 +16814,11 @@ display_portfolio_performance_graphs(
         "Linear_Ensemble_vw": "Portfolios/Linear_ensemble_decile_portfolios_value_weight_winsorized.parquet",
         "GBRT_vw": "Portfolios/GBRT_decile_portfolios_value_weight_winsorized.parquet",
         "RF_vw": "Portfolios/RF_decile_portfolios_value_weight_winsorized.parquet",
+        "FFNN1_vw": "Portfolios/FFNN1_decile_portfolios_value_weight_winsorized.parquet",
+        "FFNN2_vw": "Portfolios/FFNN2_decile_portfolios_value_weight_winsorized.parquet",
+        "FFNN3_vw": "Portfolios/FFNN3_decile_portfolios_value_weight_winsorized.parquet",
+        "FFNN4_vw": "Portfolios/FFNN4_decile_portfolios_value_weight_winsorized.parquet",
+        "FFNN5_vw": "Portfolios/FFNN5_decile_portfolios_value_weight_winsorized.parquet",
         "NonLinear_Ensemble_vw": "Portfolios/Non_linear_ensemble_decile_portfolios_value_weight_winsorized.parquet"})
 
 """Alternative data"""
@@ -12822,6 +16834,11 @@ display_portfolio_performance_graphs(
         "Linear_Ensemble_eq": "Portfolios/Linear_ensemble_decile_portfolios_equal_weight_alternative_data.parquet",
         "GBRT_eq": "Portfolios/GBRT_decile_portfolios_equal_weight_alternative_data.parquet",
         "RF_eq": "Portfolios/RF_decile_portfolios_equal_weight_alternative_data.parquet",
+        "FFNN1_eq": "Portfolios/FFNN1_decile_portfolios_equal_weight_alternative_data.parquet",
+        "FFNN2_eq": "Portfolios/FFNN2_decile_portfolios_equal_weight_alternative_data.parquet",
+        "FFNN3_eq": "Portfolios/FFNN3_decile_portfolios_equal_weight_alternative_data.parquet",
+        "FFNN4_eq": "Portfolios/FFNN4_decile_portfolios_equal_weight_alternative_data.parquet",
+        "FFNN5_eq": "Portfolios/FFNN5_decile_portfolios_equal_weight_alternative_data.parquet",
         "NonLinear_Ensemble_eq": "Portfolios/Non_linear_ensemble_decile_portfolios_equal_weight_alternative_data.parquet",
 
         # Value weight
@@ -12833,6 +16850,11 @@ display_portfolio_performance_graphs(
         "Linear_Ensemble_vw": "Portfolios/Linear_ensemble_decile_portfolios_value_weight_alternative_data.parquet",
         "GBRT_vw": "Portfolios/GBRT_decile_portfolios_value_weight_alternative_data.parquet",
         "RF_vw": "Portfolios/RF_decile_portfolios_value_weight_alternative_data.parquet",
+        "FFNN1_vw": "Portfolios/FFNN1_decile_portfolios_value_weight_alternative_data.parquet",
+        "FFNN2_vw": "Portfolios/FFNN2_decile_portfolios_value_weight_alternative_data.parquet",
+        "FFNN3_vw": "Portfolios/FFNN3_decile_portfolios_value_weight_alternative_data.parquet",
+        "FFNN4_vw": "Portfolios/FFNN4_decile_portfolios_value_weight_alternative_data.parquet",
+        "FFNN5_vw": "Portfolios/FFNN5_decile_portfolios_value_weight_alternative_data.parquet",
         "NonLinear_Ensemble_vw": "Portfolios/Non_linear_ensemble_decile_portfolios_value_weight_alternative_data.parquet"})
 
 """Top universe"""
@@ -12848,6 +16870,11 @@ display_portfolio_performance_graphs(
         "Linear_Ensemble_eq": "Portfolios/Linear_ensemble_decile_portfolios_equal_weight_top.parquet",
         "GBRT_eq": "Portfolios/GBRT_decile_portfolios_equal_weight_top.parquet",
         "RF_eq": "Portfolios/RF_decile_portfolios_equal_weight_top.parquet",
+        "FFNN1_eq": "Portfolios/FFNN1_decile_portfolios_equal_weight_top.parquet",
+        "FFNN2_eq": "Portfolios/FFNN2_decile_portfolios_equal_weight_top.parquet",
+        "FFNN3_eq": "Portfolios/FFNN3_decile_portfolios_equal_weight_top.parquet",
+        "FFNN4_eq": "Portfolios/FFNN4_decile_portfolios_equal_weight_top.parquet",
+        "FFNN5_eq": "Portfolios/FFNN5_decile_portfolios_equal_weight_top.parquet",
         "NonLinear_Ensemble_eq": "Portfolios/Non_linear_ensemble_decile_portfolios_equal_weight_top.parquet",
 
         # Value weight
@@ -12859,6 +16886,11 @@ display_portfolio_performance_graphs(
         "Linear_Ensemble_vw": "Portfolios/Linear_ensemble_decile_portfolios_value_weight_top.parquet",
         "GBRT_vw": "Portfolios/GBRT_decile_portfolios_value_weight_top.parquet",
         "RF_vw": "Portfolios/RF_decile_portfolios_value_weight_top.parquet",
+        "FFNN1_vw": "Portfolios/FFNN1_decile_portfolios_value_weight_top.parquet",
+        "FFNN2_vw": "Portfolios/FFNN2_decile_portfolios_value_weight_top.parquet",
+        "FFNN3_vw": "Portfolios/FFNN3_decile_portfolios_value_weight_top.parquet",
+        "FFNN4_vw": "Portfolios/FFNN4_decile_portfolios_value_weight_top.parquet",
+        "FFNN5_vw": "Portfolios/FFNN5_decile_portfolios_value_weight_top.parquet",
         "NonLinear_Ensemble_vw": "Portfolios/Non_linear_ensemble_decile_portfolios_value_weight_top.parquet"})
 
 """Bottom universe"""
@@ -12874,6 +16906,11 @@ display_portfolio_performance_graphs(
         "Linear_Ensemble_eq": "Portfolios/Linear_ensemble_decile_portfolios_equal_weight_bottom.parquet",
         "GBRT_eq": "Portfolios/GBRT_decile_portfolios_equal_weight_bottom.parquet",
         "RF_eq": "Portfolios/RF_decile_portfolios_equal_weight_bottom.parquet",
+        "FFNN1_eq": "Portfolios/FFNN1_decile_portfolios_equal_weight_bottom.parquet",
+        "FFNN2_eq": "Portfolios/FFNN2_decile_portfolios_equal_weight_bottom.parquet",
+        "FFNN3_eq": "Portfolios/FFNN3_decile_portfolios_equal_weight_bottom.parquet",
+        "FFNN4_eq": "Portfolios/FFNN4_decile_portfolios_equal_weight_bottom.parquet",
+        "FFNN5_eq": "Portfolios/FFNN5_decile_portfolios_equal_weight_bottom.parquet",
         "NonLinear_Ensemble_eq": "Portfolios/Non_linear_ensemble_decile_portfolios_equal_weight_bottom.parquet",
 
         # Value weight
@@ -12885,6 +16922,11 @@ display_portfolio_performance_graphs(
         "Linear_Ensemble_vw": "Portfolios/Linear_ensemble_decile_portfolios_value_weight_bottom.parquet",
         "GBRT_vw": "Portfolios/GBRT_decile_portfolios_value_weight_bottom.parquet",
         "RF_vw": "Portfolios/RF_decile_portfolios_value_weight_bottom.parquet",
+        "FFNN1_vw": "Portfolios/FFNN1_decile_portfolios_value_weight_bottom.parquet",
+        "FFNN2_vw": "Portfolios/FFNN2_decile_portfolios_value_weight_bottom.parquet",
+        "FFNN3_vw": "Portfolios/FFNN3_decile_portfolios_value_weight_bottom.parquet",
+        "FFNN4_vw": "Portfolios/FFNN4_decile_portfolios_value_weight_bottom.parquet",
+        "FFNN5_vw": "Portfolios/FFNN5_decile_portfolios_value_weight_bottom.parquet",
         "NonLinear_Ensemble_vw": "Portfolios/Non_linear_ensemble_decile_portfolios_value_weight_bottom.parquet"})
 
 """Alternative industries"""
@@ -12900,6 +16942,11 @@ display_portfolio_performance_graphs(
         "Linear_Ensemble_eq": "Portfolios/Linear_ensemble_decile_portfolios_equal_weight_alternative_industries.parquet",
         "GBRT_eq": "Portfolios/GBRT_decile_portfolios_equal_weight_alternative_industries.parquet",
         "RF_eq": "Portfolios/RF_decile_portfolios_equal_weight_alternative_industries.parquet",
+        "FFNN1_eq": "Portfolios/FFNN1_decile_portfolios_equal_weight_alternative_industries.parquet",
+        "FFNN2_eq": "Portfolios/FFNN2_decile_portfolios_equal_weight_alternative_industries.parquet",
+        "FFNN3_eq": "Portfolios/FFNN3_decile_portfolios_equal_weight_alternative_industries.parquet",
+        "FFNN4_eq": "Portfolios/FFNN4_decile_portfolios_equal_weight_alternative_industries.parquet",
+        "FFNN5_eq": "Portfolios/FFNN5_decile_portfolios_equal_weight_alternative_industries.parquet",
         "NonLinear_Ensemble_eq": "Portfolios/Non_linear_ensemble_decile_portfolios_equal_weight_alternative_industries.parquet",
 
         # Value weight
@@ -12911,6 +16958,11 @@ display_portfolio_performance_graphs(
         "Linear_Ensemble_vw": "Portfolios/Linear_ensemble_decile_portfolios_value_weight_alternative_industries.parquet",
         "GBRT_vw": "Portfolios/GBRT_decile_portfolios_value_weight_alternative_industries.parquet",
         "RF_vw": "Portfolios/RF_decile_portfolios_value_weight_alternative_industries.parquet",
+        "FFNN1_vw": "Portfolios/FFNN1_decile_portfolios_value_weight_alternative_industries.parquet",
+        "FFNN2_vw": "Portfolios/FFNN2_decile_portfolios_value_weight_alternative_industries.parquet",
+        "FFNN3_vw": "Portfolios/FFNN3_decile_portfolios_value_weight_alternative_industries.parquet",
+        "FFNN4_vw": "Portfolios/FFNN4_decile_portfolios_value_weight_alternative_industries.parquet",
+        "FFNN5_vw": "Portfolios/FFNN5_decile_portfolios_value_weight_alternative_industries.parquet",
         "NonLinear_Ensemble_vw": "Portfolios/Non_linear_ensemble_decile_portfolios_value_weight_alternative_industries.parquet"})
 
 """Alternative sample split"""
@@ -12926,6 +16978,11 @@ display_portfolio_performance_graphs(
         "Linear_Ensemble_eq": "Portfolios/Linear_ensemble_decile_portfolios_equal_weight_alternative_sample_split.parquet",
         "GBRT_eq": "Portfolios/GBRT_decile_portfolios_equal_weight_alternative_sample_split.parquet",
         "RF_eq": "Portfolios/RF_decile_portfolios_equal_weight_alternative_sample_split.parquet",
+        "FFNN1_eq": "Portfolios/FFNN1_decile_portfolios_equal_weight_alternative_sample_split.parquet",
+        "FFNN2_eq": "Portfolios/FFNN2_decile_portfolios_equal_weight_alternative_sample_split.parquet",
+        "FFNN3_eq": "Portfolios/FFNN3_decile_portfolios_equal_weight_alternative_sample_split.parquet",
+        "FFNN4_eq": "Portfolios/FFNN4_decile_portfolios_equal_weight_alternative_sample_split.parquet",
+        "FFNN5_eq": "Portfolios/FFNN5_decile_portfolios_equal_weight_alternative_sample_split.parquet",
         "NonLinear_Ensemble_eq": "Portfolios/Non_linear_ensemble_decile_portfolios_equal_weight_alternative_sample_split.parquet",
 
         # Value weight
@@ -12937,4 +16994,30 @@ display_portfolio_performance_graphs(
         "Linear_Ensemble_vw": "Portfolios/Linear_ensemble_decile_portfolios_value_weight_alternative_sample_split.parquet",
         "GBRT_vw": "Portfolios/GBRT_decile_portfolios_value_weight_alternative_sample_split.parquet",
         "RF_vw": "Portfolios/RF_decile_portfolios_value_weight_alternative_sample_split.parquet",
+        "FFNN1_vw": "Portfolios/FFNN1_decile_portfolios_value_weight_alternative_sample_split.parquet",
+        "FFNN2_vw": "Portfolios/FFNN2_decile_portfolios_value_weight_alternative_sample_split.parquet",
+        "FFNN3_vw": "Portfolios/FFNN3_decile_portfolios_value_weight_alternative_sample_split.parquet",
+        "FFNN4_vw": "Portfolios/FFNN4_decile_portfolios_value_weight_alternative_sample_split.parquet",
+        "FFNN5_vw": "Portfolios/FFNN5_decile_portfolios_value_weight_alternative_sample_split.parquet",
         "NonLinear_Ensemble_vw": "Portfolios/Non_linear_ensemble_decile_portfolios_value_weight_alternative_sample_split.parquet"})
+
+"""## Sample split scheme
+
+Expanding-window
+"""
+
+fig, ax = display_expanding_sample_split_figure(
+    sample_end="2023-12-31",
+    start_train="1970-01-01",
+    end_train="1986-12-31",
+    val_years=12,
+    figsize=(14, 8))
+
+"""Fixed-window"""
+
+fig, ax = display_fixed_window_sample_split_figure(
+    sample_end="2023-12-31",
+    start_train="1970-01-01",
+    end_train="1986-12-31",
+    val_years=12,
+    figsize=(14, 8))
