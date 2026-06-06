@@ -1,2 +1,2 @@
-# Linear_vs_Non_Linear_Return_Forecasting_Research_Paper
+# Linear_vs_Non_Linear_Return_Forecasting_Thesis_Paper
 INCOMPLETE, TBA
