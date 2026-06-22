@@ -1,9 +1,8 @@
 # Linear_vs_Non_Linear_Return_Forecasting_Thesis_Paper
-# Linear vs. Non-Linear Return Forecasting
 
-A quantitative asset-pricing research project comparing whether non-linear machine-learning models provide incremental value over dimension-reduced linear models in equity return forecasting.
+This project is a condenced version of my MSc thesis in Quantitative Finance for the CFA Quant Awards 2026. This asset-pricing research compares whether non-linear machine-learning models provide incremental value over dimension-reduced linear models in equity return forecasting.
 
-The project evaluates both **statistical predictive accuracy** and **economic portfolio value** using a large-scale U.S. equity panel of approximately **3.4 million stock-month observations** and **150+ firm-level characteristics**.
+The research evaluates both **statistical predictive accuracy** and **economic portfolio value** using a large-scale U.S. equity panel of approximately **3.4 million stock-month observations** and **150+ firm-level characteristics**.
 
 ## Research Question
 
@@ -15,20 +14,20 @@ Rather than comparing flexible models only against simple OLS benchmarks, this p
 
 The forecasting target is the one-month-ahead excess return of stock (i) at time (t+1), estimated from firm characteristics observed at time (t).
 
-The empirical framework compares three model groups:
+The empirical framework compares four model groups:
 
 | Model Class                     | Models                                                                         |
 | ------------------------------- | ------------------------------------------------------------------------------ |
-| Linear benchmarks               | OLS, OLS-FF3                                                                   |
+| Simple linear                   | OLS, OLS-FF3                                                                   |
 | Dimension-reduced linear models | PCR, IPCA, PLS                                                                 |
-| Non-linear models               | Gradient Boosted Regression Trees, Random Forests, Feedforward Neural Networks |
+| Non-linear models               | GBRT, RF, FFNN                                                                 |
 | Ensembles                       | Equal-weighted linear and non-linear forecast ensembles                        |
 
 All models are evaluated using an expanding-window training design with a rolling validation sample and a fully out-of-sample test period.
 
 ## Data and Preprocessing
 
-The analysis uses the Jensen, Kelly and Pedersen Global Factor Data library accessed through WRDS.
+The analysis uses the Jensen et al. (2022) Global Factor Data library accessed through WRDS.
 
 Key preprocessing steps:
 
@@ -61,7 +60,7 @@ Predicted returns are converted into monthly long-short decile portfolios:
 * Equal-weighted and value-weighted implementations
 * Realistic transaction-cost adjustment
 * Sharpe Ratio and Probabilistic Sharpe Ratio
-* CAPM and Fama-French 5-Factor alpha
+* Capital Asset Pricing Model and Fama-French 5-Factor alpha
 * Turnover, maximum drawdown and downside-risk analysis
 
 ## Key Findings
@@ -81,48 +80,6 @@ Predicted returns are converted into monthly long-short decile portfolios:
 5. **Portfolio construction determines whether machine-learning complexity adds value.**
    Similar stock-level predictive accuracy can translate into different realised portfolio outcomes once forecasts are ranked, weighted and traded.
 
-## Repository Structure
-
-```text
-.
-├── data/                  # Local data directory, excluded from Git
-├── notebooks/             # Exploratory analysis and model development
-├── src/                   # Core modelling, preprocessing and portfolio code
-├── results/               # Tables, figures and model outputs
-├── reports/               # Research paper and supporting material
-├── requirements.txt       # Python dependencies
-└── README.md
-```
-
-## Suggested Workflow
-
-```bash
-# Clone the repository
-git clone https://github.com/gordy93/linear-vs-nonlinear-return-forecasting.git
-cd linear-vs-nonlinear-return-forecasting
-
-# Create a virtual environment
-python -m venv .venv
-source .venv/bin/activate
-
-# Install dependencies
-pip install -r requirements.txt
-```
-
-A typical research pipeline follows:
-
-```text
-1. Load and clean firm-level characteristics
-2. Apply rank transformation and lag predictors
-3. Split data into training, validation and test windows
-4. Train linear, dimension-reduced and non-linear models
-5. Generate monthly out-of-sample return forecasts
-6. Evaluate statistical predictive accuracy
-7. Construct long-short decile portfolios
-8. Apply transaction costs and compute risk-adjusted performance
-9. Analyse characteristic importance and robustness results
-```
-
 ## Main Contribution
 
 This project provides a stricter test of non-linearity in empirical asset pricing.
@@ -132,8 +89,3 @@ The results suggest that the value of machine-learning complexity should not be 
 In short:
 
 > Complexity is not a substitute for economic discipline; it is only useful when it improves realised investment outcomes.
-
-## Keywords
-
-`quantitative finance` · `asset pricing` · `machine learning` · `return forecasting` · `factor investing` · `portfolio construction` · `cross-sectional equity returns` · `out-of-sample testing` · `dimension reduction` · `long-short portfolios`
-
